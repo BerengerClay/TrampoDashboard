@@ -1,0 +1,183 @@
+_base_ = ["mmpose_src/configs/_base_/default_runtime.py"]
+
+# runtime
+train_cfg = dict(max_epochs=150, val_interval=1)
+
+# optimizer
+custom_imports = dict(
+    imports=[
+        "mmpose.engine.optim_wrappers.layer_decay_optim_wrapper",
+        "mmpretrain",
+    ],
+    allow_failed_imports=False,
+)
+
+optim_wrapper = dict(
+    optimizer=dict(type="AdamW", lr=1e-4, betas=(0.9, 0.999), weight_decay=0.1),
+    paramwise_cfg=dict(
+        num_layers=12,
+        layer_decay_rate=0.8,
+        custom_keys={
+            "bias": dict(decay_multi=0.0),
+            "pos_embed": dict(decay_mult=0.0),
+            "relative_position_bias_table": dict(decay_mult=0.0),
+            "norm": dict(decay_mult=0.0),
+        },
+    ),
+    constructor="LayerDecayOptimWrapperConstructor",
+    clip_grad=dict(max_norm=1.0, norm_type=2),
+)
+
+# learning policy
+param_scheduler = [
+    dict(
+        type="LinearLR", begin=0, end=200, start_factor=0.001, by_epoch=False
+    ),  # warm-up
+    dict(
+        type="MultiStepLR",
+        begin=0,
+        end=150,
+        milestones=[120, 140],
+        gamma=0.1,
+        by_epoch=True,
+    ),
+]
+
+# automatically scaling LR based on the actual training batch size
+auto_scale_lr = dict(base_batch_size=512)
+
+# hooks
+default_hooks = dict(
+    checkpoint=dict(save_best="coco/AP", rule="greater", max_keep_ckpts=1)
+)
+
+# codec settings
+codec = dict(type="UDPHeatmap", input_size=(192, 256), heatmap_size=(48, 64), sigma=2)
+
+# model settings
+model = dict(
+    type="TopdownPoseEstimator",
+    init_cfg=dict(
+        type="Pretrained",
+        checkpoint="weights/best_mvssl_AP713_iter290.pth",
+    ),
+    data_preprocessor=dict(
+        type="PoseDataPreprocessor",
+        mean=[123.675, 116.28, 103.53],
+        std=[58.395, 57.12, 57.375],
+        bgr_to_rgb=True,
+    ),
+    backbone=dict(
+        type="mmpretrain.VisionTransformer",
+        arch={
+            "embed_dims": 384,
+            "num_layers": 12,
+            "num_heads": 12,
+            "feedforward_channels": 384 * 4,
+        },
+        img_size=(256, 192),
+        patch_size=16,
+        qkv_bias=True,
+        drop_path_rate=0.1,
+        with_cls_token=False,
+        out_type="featmap",
+        patch_cfg=dict(padding=2),
+        init_cfg=dict(
+            type="Pretrained",
+            checkpoint="https://download.openmmlab.com/mmpose/"
+            "v1/pretrained_models/mae_pretrain_vit_small_20230913.pth",
+        ),
+    ),
+    head=dict(
+        type="HeatmapHead",
+        in_channels=384,
+        out_channels=17,
+        deconv_out_channels=(256, 256),
+        deconv_kernel_sizes=(4, 4),
+        loss=dict(type="KeypointMSELoss", use_target_weight=True),
+        decoder=codec,
+    ),
+    test_cfg=dict(
+        flip_test=True,
+        flip_mode="heatmap",
+        shift_heatmap=False,
+    ),
+)
+
+# base dataset settings
+data_root = "/home/lea/trampo/MODELS_2D3D/finetuning2d/mmpose/data/trampo/"
+dataset_type = "CocoDataset"
+data_mode = "topdown"
+
+# pipelines
+train_pipeline = [
+    dict(type="LoadImage"),
+    dict(type="GetBBoxCenterScale"),
+    dict(type="RandomFlip", direction="horizontal"),
+    dict(type="RandomHalfBody"),
+    dict(type="RandomBBoxTransform"),
+    dict(type="TopdownAffine", input_size=codec["input_size"], use_udp=True),
+    dict(type="GenerateTarget", encoder=codec),
+    dict(type="PackPoseInputs"),
+]
+val_pipeline = [
+    dict(type="LoadImage"),
+    dict(type="GetBBoxCenterScale"),
+    dict(type="TopdownAffine", input_size=codec["input_size"], use_udp=True),
+    dict(type="PackPoseInputs"),
+]
+# data loaders
+train_dataloader = dict(
+    batch_size=256,
+    num_workers=4,
+    persistent_workers=True,
+    sampler=dict(type="DefaultSampler", shuffle=True),
+    dataset=dict(
+        type=dataset_type,
+        data_root=data_root,
+        data_mode=data_mode,
+        ann_file="train_trampo_2520_lsp_full_RePoGenTB.json",
+        data_prefix=dict(img=""),
+        pipeline=train_pipeline,
+    ),
+)
+
+val_dataloader = dict(
+    batch_size=12,
+    num_workers=4,
+    persistent_workers=True,
+    sampler=dict(type="DefaultSampler", shuffle=False),
+    dataset=dict(
+        type=dataset_type,
+        data_root=data_root,
+        data_mode=data_mode,
+        ann_file="trampo_test_preds_monocular.json",
+        data_prefix=dict(img=""),
+        pipeline=val_pipeline,
+    ),
+)
+
+test_dataloader = dict(
+    batch_size=128,
+    num_workers=4,
+    persistent_workers=True,
+    sampler=dict(type="DefaultSampler", shuffle=False),
+    dataset=dict(
+        type=dataset_type,
+        data_root="Data/Test_set_MRT/",
+        data_mode=data_mode,
+        ann_file="mrt_548.json",
+        data_prefix=dict(img="images/"),
+        pipeline=val_pipeline,
+        test_mode=True,
+    ),
+)
+
+
+# evaluators
+val_evaluator = dict(
+    type="CocoMetric", ann_file=data_root + "trampo_test_preds_monocular.json"
+)
+test_evaluator = dict(
+    type="CocoMetric", ann_file="Data/Test_set_MRT/mrt_548.json"
+)

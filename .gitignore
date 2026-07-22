@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Caches & Logs
+.pytest_cache/
+*.log
+annotator.log
+tmp.txt
+
+# Environment variables
+.env
+.env.local
+
+# Datasets and Heavy Media Files
+Data/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Predictions & Heavy JSON/PKL Data
+*.pkl
+*.pickle
+output/
+
+# Model Weights
+weights/
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.bin
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+configs/local_settings.json

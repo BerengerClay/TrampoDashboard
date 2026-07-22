@@ -1,0 +1,2604 @@
+import os
+import sys
+import re
+import json
+import cv2
+import numpy as np
+import torch
+
+try:
+    import tomllib
+    def toml_load(f):
+        return tomllib.load(f)
+except ImportError:
+    try:
+        import tomli
+        def toml_load(f):
+            return tomli.load(f)
+    except ImportError:
+        import toml
+        def toml_load(f):
+            content = f.read().decode("utf-8")
+            return toml.loads(content)
+
+from PyQt6.QtWidgets import (
+    QMainWindow,
+    QWidget,
+    QGridLayout,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QMessageBox,
+    QLabel,
+    QStatusBar,
+    QProgressDialog,
+    QSlider,
+    QDialog,
+    QSpinBox,
+    QMenu,
+)
+from PyQt6.QtGui import QKeySequence, QShortcut, QColor
+from PyQt6.QtCore import Qt, QTimer, QRectF
+
+from constants import CAMERA_KEYS
+from widgets import CameraWidget
+from workers import WorkerThread
+from dialogs import (
+    SettingsDialog,
+    KalmanSettingsDialog,
+    SelectCameraFoldersDialog,
+    select_multiple_directories,
+)
+from visualizer3d import Visualizer3DWindow, Visualizer3DWidget
+from backend import ModelWrapper
+from icons import get_lucide_icon
+
+
+SETTINGS_FILE = os.path.join("configs", "local_settings.json")
+
+
+def log_debug(msg):
+    try:
+        import datetime
+
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        with open("annotator.log", "a", encoding="utf-8") as f:
+            f.write(f"[{now}] {msg}\n")
+            f.flush()
+    except Exception:
+        pass
+
+
+class TrampolineAnnotator(QMainWindow):
+    def __init__(self, paths=None, gt_path=None):
+        log_debug("TrampolineAnnotator.__init__ started")
+        super().__init__()
+        self.setWindowTitle("Multi-View Trampoline Jumper Annotator")
+        self.setGeometry(100, 100, 1600, 950)
+
+        # Application state
+        self.sequence_dir = None
+        self.camera_dirs = {}
+        self.json_path = None
+        self.sorted_frames = []
+        self.current_frame_idx = -1
+        self.frame_data = {}  # frame_idx -> {camera_key -> filepath}
+        self.gt_path = gt_path
+        self.show_gt_overlay = True if gt_path else False
+        self.gt_3d_coords = None
+        self.gt_3d_frame_numbers = None
+        self.gt_2d_map = None
+
+        self.coco_data = {
+            "images": [],
+            "annotations": [],
+            "categories": [{"id": 1, "name": "person"}],
+        }
+        self.img_ann_map = {}  # image_id -> annotation dict
+        self.img_file_map = {}  # file_name -> image dict
+
+        # Load camera matrices
+        self.camera_matrices = self.load_camera_matrices()
+        self.calib_data = self.load_calib_data()
+
+        # Load local settings
+        saved_settings = self.load_local_settings() or {}
+
+        # Deep learning models
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Resolve paths from local settings or use default paths
+        src_dir = os.path.dirname(os.path.abspath(__file__))
+        root_dir = os.path.dirname(src_dir)
+        
+        default_yolo_path = os.path.join(root_dir, "weights", "YOLO26s_best.pt")
+        default_vitpose_path = os.path.join(root_dir, "weights", "best_ViTPose-s_AP731.pth")
+        
+        def resolve_path(p, default):
+            if not p:
+                return default
+            if os.path.isabs(p):
+                return p
+            return os.path.abspath(os.path.join(root_dir, p))
+
+        self.yolo_path = resolve_path(saved_settings.get("yolo_path"), default_yolo_path)
+        self.vitpose_path = resolve_path(saved_settings.get("vitpose_path"), default_vitpose_path)
+
+        self.model_wrapper = ModelWrapper(
+            weights_dir=None,
+            device=self.device,
+            yolo_path=self.yolo_path,
+            vitpose_path=self.vitpose_path
+        )
+        self.active_worker = None
+        self.keypoint_radius = saved_settings.get("keypoint_radius", 3)
+        self.visualizer_3d_window = None
+        self.auto_rotate_enabled = saved_settings.get("auto_rotate_enabled", True)
+        self.global_3d_bounds = None
+        self.show_3d_reprojection = saved_settings.get("show_3d_reprojection", False)
+        self.show_kalman_overlay = saved_settings.get("show_kalman_overlay", False)
+        self.realtime_triangulation_enabled = saved_settings.get(
+            "realtime_triangulation_enabled", False
+        )
+        self.delete_bbox_on_clear = saved_settings.get("delete_bbox_on_clear", False)
+        self.vitpose_show_confidence = saved_settings.get(
+            "vitpose_show_confidence", True
+        )
+        self.vitpose_threshold = saved_settings.get("vitpose_threshold", 0.2)
+        self.frame_step = saved_settings.get("frame_step", 1)
+        self.start_frame_idx = saved_settings.get("start_frame_idx", 0)
+        self.interpolated_opacity = saved_settings.get("interpolated_opacity", 0.4)
+        self.keypoint_size_3d = saved_settings.get("keypoint_size_3d", 50)
+        self.visualizer_fps = saved_settings.get("visualizer_fps", 30)
+        self.kalman_enabled = saved_settings.get("kalman_enabled", True)
+        self.kalman_q = saved_settings.get("kalman_q", 0.01)
+        self.kalman_r = saved_settings.get("kalman_r", 0.1)
+        self.use_kalman_trc = saved_settings.get("use_kalman_trc", False)
+        self.trc_coords_raw = None
+        # Determine initial navigation mode (map old boolean check if present)
+        if "navigation_mode" in saved_settings:
+            self.navigation_mode = saved_settings["navigation_mode"]
+        else:
+            old_show = saved_settings.get("show_intermediate_frames", True)
+            self.navigation_mode = "all" if old_show else "annotate"
+
+        # History stacks for Undo/Redo
+        self.undo_stack = []
+        self.redo_stack = []
+        self.max_history = 50
+
+        self.init_ui()
+        self.apply_dark_style()
+        self.setup_shortcuts()
+
+        # Load sequence if provided via argument, otherwise check saved session, else prompt
+        if paths:
+            self.load_sequence_from_cli_paths(paths)
+        else:
+            saved_dirs = saved_settings.get("camera_dirs")
+            dirs_valid = False
+            resolved_dirs = {}
+            if isinstance(saved_dirs, dict) and len(saved_dirs) == len(CAMERA_KEYS):
+                project_root = os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))
+                )
+                dirs_valid = True
+                for k, path in saved_dirs.items():
+                    if os.path.isdir(path):
+                        resolved_dirs[k] = os.path.abspath(path)
+                    else:
+                        full_path = os.path.abspath(os.path.join(project_root, path))
+                        if os.path.isdir(full_path):
+                            resolved_dirs[k] = full_path
+                        else:
+                            dirs_valid = False
+                            break
+
+            if dirs_valid:
+                self.camera_dirs = resolved_dirs
+                first_dir = next(iter(self.camera_dirs.values()))
+                self.sequence_dir = os.path.dirname(first_dir)
+                self.load_sequence_from_dirs(self.camera_dirs)
+            else:
+                self.prompt_select_sequence()
+
+        if self.gt_path:
+            self.load_gt_file(self.gt_path)
+
+        log_debug("TrampolineAnnotator.__init__ completed successfully")
+
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+
+        main_layout = QHBoxLayout(main_widget)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(15)
+
+        # Left Panel: Camera views in a grid
+        self.grid_layout = QGridLayout()
+        self.grid_layout.setSpacing(10)
+        self.camera_widgets = []
+
+        # Set equal stretches to ensure the grid is perfectly balanced when restored
+        for r in range(2):
+            self.grid_layout.setRowStretch(r, 1)
+        for c in range(4):
+            self.grid_layout.setColumnStretch(c, 1)
+
+        for i, key in enumerate(CAMERA_KEYS):
+            cam = CameraWidget(camera_id=i, camera_name=key, main_win=self)
+            self.camera_widgets.append(cam)
+            self.grid_layout.addWidget(cam, i // 4, i % 4)
+
+        main_layout.addLayout(self.grid_layout, stretch=4)
+
+        # Right Panel: Sidebar control dashboard
+        sidebar = QVBoxLayout()
+        sidebar.setSpacing(15)
+
+        # Sequence path label
+        self.path_lbl = QLabel("No Sequence Loaded")
+        self.path_lbl.setWordWrap(True)
+        self.path_lbl.setStyleSheet("color: #64748b; font-size: 11px;")
+
+        # Frame tracker row layout (label + undo/redo buttons)
+        frame_row_layout = QHBoxLayout()
+
+        self.frame_lbl = QLabel("Frame: 0 / 0")
+        self.frame_lbl.setStyleSheet(
+            "color: #f8fafc; font-size: 18px; font-weight: bold;"
+        )
+        frame_row_layout.addWidget(self.frame_lbl)
+        frame_row_layout.addStretch()
+
+        # Undo button next to label
+        self.btn_undo = QPushButton()
+        self.btn_undo.setIcon(get_lucide_icon("undo", color="#ffffff"))
+        self.btn_undo.setToolTip("Undo last action (Ctrl+Z)")
+        self.btn_undo.clicked.connect(self.undo)
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.setFixedSize(28, 28)
+        self.btn_undo.setStyleSheet("""
+            QPushButton {
+                padding: 4px;
+                border-radius: 4px;
+                background-color: #1e293b;
+                border: 1px solid #334155;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                border-color: #475569;
+            }
+            QPushButton:disabled {
+                background-color: transparent;
+                border-color: transparent;
+            }
+        """)
+
+        # Redo button next to label
+        self.btn_redo = QPushButton()
+        self.btn_redo.setIcon(get_lucide_icon("redo", color="#ffffff"))
+        self.btn_redo.setToolTip("Redo last action (Ctrl+Shift+Z)")
+        self.btn_redo.clicked.connect(self.redo)
+        self.btn_redo.setEnabled(False)
+        self.btn_redo.setFixedSize(28, 28)
+        self.btn_redo.setStyleSheet("""
+            QPushButton {
+                padding: 4px;
+                border-radius: 4px;
+                background-color: #1e293b;
+                border: 1px solid #334155;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                border-color: #475569;
+            }
+            QPushButton:disabled {
+                background-color: transparent;
+                border-color: transparent;
+            }
+        """)
+
+        frame_row_layout.addWidget(self.btn_undo)
+        frame_row_layout.addWidget(self.btn_redo)
+
+        # Buttons
+        btn_open = QPushButton("Select Sequence...")
+        btn_open.setIcon(get_lucide_icon("folder-open", color="#f8fafc"))
+        btn_open.clicked.connect(self.prompt_select_sequence)
+
+        # Settings & Kalman buttons (side-by-side layout)
+        self.settings_bar_layout = QHBoxLayout()
+        self.settings_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_bar_layout.setSpacing(6)
+
+        self.btn_settings = QPushButton("Settings")
+        self.btn_settings.setIcon(get_lucide_icon("settings", color="#f8fafc"))
+        self.btn_settings.setToolTip("Application Settings")
+        self.btn_settings.clicked.connect(self.show_settings)
+        self.btn_settings.setStyleSheet(
+            "background-color: #1e293b; border: 1px solid #334155; padding: 5px;"
+        )
+
+        self.btn_kalman = QPushButton("Kalman Filter")
+        self.btn_kalman.setIcon(get_lucide_icon("sliders", color="#ffffff"))
+        self.btn_kalman.setToolTip("RTS Kalman Filter Settings & TRC Generation")
+        self.btn_kalman.clicked.connect(self.show_kalman_dialog)
+        self.btn_kalman.setStyleSheet(
+            "background-color: #1e293b; border: 1px solid #334155; padding: 5px;"
+        )
+
+        self.settings_bar_layout.addWidget(self.btn_settings)
+        self.settings_bar_layout.addWidget(self.btn_kalman)
+
+        # Maximize view indicators
+        self.mode_lbl = QLabel("Grid Mode (Double click view to zoom)")
+        self.mode_lbl.setStyleSheet("color: #38bdf8; font-weight: bold;")
+
+        # View navigation buttons (only shown in maximized view mode)
+        self.view_nav_layout = QHBoxLayout()
+        self.view_nav_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.btn_prev_view = QPushButton("Prev View")
+        self.btn_prev_view.setIcon(get_lucide_icon("arrow-left", color="#ffffff"))
+        self.btn_prev_view.clicked.connect(self.show_prev_camera_view)
+        self.btn_prev_view.setStyleSheet(
+            "background-color: #1e293b; border: 1px solid #334155; padding: 6px 12px;"
+        )
+
+        self.btn_next_view = QPushButton("Next View")
+        self.btn_next_view.setIcon(get_lucide_icon("arrow-right", color="#ffffff"))
+        self.btn_next_view.clicked.connect(self.show_next_camera_view)
+        self.btn_next_view.setStyleSheet(
+            "background-color: #1e293b; border: 1px solid #334155; padding: 6px 12px;"
+        )
+
+        self.view_nav_layout.addWidget(self.btn_prev_view)
+        self.view_nav_layout.addWidget(self.btn_next_view)
+
+        self.btn_prev_view.hide()
+        self.btn_next_view.hide()
+
+        # AI commands and Triangulation
+
+        self.btn_preprocess_seq = QPushButton("Preprocess Sequence")
+        self.btn_preprocess_seq.setIcon(get_lucide_icon("sparkles", color="#ffffff"))
+        self.btn_preprocess_seq.clicked.connect(self.run_sequence_preprocessing)
+        self.btn_preprocess_seq.setEnabled(False)
+        self.btn_preprocess_seq.setStyleSheet("""
+            QPushButton {
+                background-color: #7c3aed;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #7c3aed;
+            }
+            QPushButton:hover {
+                background-color: #8b5cf6;
+                border-color: #8b5cf6;
+            }
+            QPushButton:pressed {
+                background-color: #6d28d9;
+                border-color: #6d28d9;
+            }
+            QPushButton:disabled {
+                background-color: #1e1b4b;
+                color: #64748b;
+                border-color: #1e1b4b;
+            }
+        """)
+        self.btn_preprocess_seq.setToolTip(
+            "Run YOLO + ViTPose from current frame to the end of the sequence"
+        )
+
+        self.btn_clear_frame_ann = QPushButton("Clear Frame")
+        self.btn_clear_frame_ann.setIcon(get_lucide_icon("trash-2", color="#ffffff"))
+        self.btn_clear_frame_ann.clicked.connect(self.clear_current_frame_annotations)
+        self.btn_clear_frame_ann.setEnabled(False)
+        self.btn_clear_frame_ann.setStyleSheet("""
+            QPushButton {
+                background-color: #dc2626;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #dc2626;
+            }
+            QPushButton:hover {
+                background-color: #ef4444;
+                border-color: #ef4444;
+            }
+            QPushButton:pressed {
+                background-color: #b91c1c;
+                border-color: #b91c1c;
+            }
+            QPushButton:disabled {
+                background-color: #451a03;
+                color: #64748b;
+                border-color: #451a03;
+            }
+        """)
+        self.btn_clear_frame_ann.setToolTip(
+            "Clear annotations for the current frame across all cameras"
+        )
+
+        self.ai_buttons_layout = QHBoxLayout()
+        self.ai_buttons_layout.setSpacing(10)
+        self.ai_buttons_layout.addWidget(self.btn_preprocess_seq)
+        self.ai_buttons_layout.addWidget(self.btn_clear_frame_ann)
+
+        self.btn_zoom_all = QPushButton("Zoom 8 Views to BBox")
+        self.btn_zoom_all.setIcon(get_lucide_icon("maximize-2", color="#ffffff"))
+        self.btn_zoom_all.clicked.connect(self.zoom_all_bboxes)
+        self.btn_zoom_all.setEnabled(False)
+        self.btn_zoom_all.setStyleSheet("background-color: #0369a1; color: white;")
+        self.btn_zoom_all.setToolTip(
+            "Zoom and rotate all 8 camera views onto their bounding boxes"
+        )
+
+        # Navigation slider
+        self.slider_frame = QSlider(Qt.Orientation.Horizontal)
+        self.slider_frame.setRange(0, 0)
+        self.slider_frame.setValue(0)
+        self.slider_frame.setEnabled(False)
+        self.slider_frame.valueChanged.connect(self.on_slider_frame_changed)
+        self.slider_frame.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border: 1px solid #475569;
+                height: 8px;
+                background: #1e293b;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #38bdf8;
+                border: 1px solid #0284c7;
+                width: 16px;
+                height: 16px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 8px;
+            }
+        """)
+
+        # Spinbox for frame editing
+        self.spin_frame = QSpinBox()
+        self.spin_frame.setRange(1, 1)
+        self.spin_frame.setValue(1)
+        self.spin_frame.setEnabled(False)
+        self.spin_frame.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.spin_frame.valueChanged.connect(self.on_spin_frame_changed)
+        self.spin_frame.setStyleSheet("""
+            QSpinBox {
+                background-color: #1e293b;
+                color: #f8fafc;
+                border: 1px solid #475569;
+                border-radius: 4px;
+                padding: 2px 4px;
+                font-weight: bold;
+                font-size: 11px;
+                min-width: 45px;
+                max-width: 60px;
+            }
+        """)
+
+        # Total frames label next to spinbox
+        self.lbl_total_frames = QLabel("/ 0")
+        self.lbl_total_frames.setStyleSheet(
+            "color: #94a3b8; font-size: 11px; font-weight: bold;"
+        )
+
+        # Navigation
+        nav_layout = QHBoxLayout()
+        self.btn_prev = QPushButton("Previous")
+        self.btn_prev.setIcon(get_lucide_icon("arrow-left", color="#ffffff"))
+        self.btn_prev.clicked.connect(self.prev_frame)
+        self.btn_next = QPushButton("Next")
+        self.btn_next.setIcon(get_lucide_icon("arrow-right", color="#ffffff"))
+        self.btn_next.clicked.connect(self.next_frame)
+
+        self.btn_nav_mode = QPushButton()
+        self.btn_nav_mode.setFixedWidth(160)
+        self.nav_menu = QMenu(self)
+        self.action_all = self.nav_menu.addAction("All Frames")
+        self.action_annotate = self.nav_menu.addAction("Stepped Frames")
+        self.action_interpolated = self.nav_menu.addAction("Interpolated Frames")
+        self.btn_nav_mode.setMenu(self.nav_menu)
+
+        self.action_all.triggered.connect(lambda: self.set_navigation_mode("all"))
+        self.action_annotate.triggered.connect(lambda: self.set_navigation_mode("annotate"))
+        self.action_interpolated.triggered.connect(lambda: self.set_navigation_mode("interpolated"))
+
+        self.update_nav_mode_button_ui()
+        self.btn_nav_mode.hide()
+        nav_layout.addWidget(self.btn_prev)
+        nav_layout.addWidget(self.btn_next)
+        nav_layout.addWidget(self.btn_nav_mode)
+
+        # Bottom controls container
+        bottom_nav_layout = QVBoxLayout()
+        bottom_nav_layout.addLayout(nav_layout)
+
+        slider_row_layout = QHBoxLayout()
+        slider_row_layout.addWidget(self.slider_frame, stretch=4)
+        slider_row_layout.addWidget(self.spin_frame, stretch=1)
+        slider_row_layout.addWidget(self.lbl_total_frames)
+        bottom_nav_layout.addLayout(slider_row_layout)
+
+        # Real-time inline 3D Visualizer widget
+        self.visualizer_3d_inline = Visualizer3DWidget(self, small_mode=True)
+        self.visualizer_3d_inline.setMinimumHeight(240)
+
+        # Assembly
+        sidebar.addLayout(frame_row_layout)
+        sidebar.addWidget(self.path_lbl)
+        sidebar.addWidget(btn_open)
+        sidebar.addLayout(self.settings_bar_layout)
+        sidebar.addWidget(self.mode_lbl)
+        sidebar.addLayout(self.view_nav_layout)
+        sidebar.addSpacing(15)
+        sidebar.addLayout(self.ai_buttons_layout)
+        sidebar.addWidget(self.btn_zoom_all)
+        sidebar.addSpacing(15)
+
+        sidebar.addStretch()  # Push everything below to the bottom!
+
+        # Bottom area: Inline 3D visualizer
+        sidebar.addWidget(self.visualizer_3d_inline)
+        sidebar.addSpacing(15)
+
+        # Navigation buttons and slider at the very bottom
+        sidebar.addLayout(bottom_nav_layout)
+
+        main_layout.addLayout(sidebar, stretch=1)
+
+        # Status Bar
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("Ready")
+
+    def load_camera_matrices(self):
+        """Loads matrices mapping 3D coordinates to 2D pixel coordinates."""
+        src_dir = os.path.dirname(os.path.abspath(__file__))
+        root_dir = os.path.dirname(src_dir)
+        path = os.path.join(root_dir, "configs", "camera_matrices.json")
+        if not os.path.exists(path):
+            path = "configs/camera_matrices.json"
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not load camera matrices: {e}")
+            return {}
+
+    def load_calib_data(self):
+        """Loads camera calibration containing lens distortion parameters from Calib.toml."""
+        src_dir = os.path.dirname(os.path.abspath(__file__))
+        root_dir = os.path.dirname(src_dir)
+        path = os.path.join(root_dir, "configs", "Calib.toml")
+        if not os.path.exists(path):
+            path = "configs/Calib.toml"
+        try:
+            with open(path, "rb") as f:
+                return toml_load(f)
+        except Exception as e:
+            print(f"Could not load Calib.toml calibration parameters: {e}")
+            return {}
+
+    def setup_shortcuts(self):
+        """Registers global hotkeys to accelerate annotations."""
+        QShortcut(QKeySequence(Qt.Key.Key_Left), self, self.prev_frame)
+        QShortcut(QKeySequence(Qt.Key.Key_Right), self, self.next_frame)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, self.reset_camera_grid)
+        QShortcut(QKeySequence(Qt.Key.Key_Y), self, self.trigger_yolo_vitpose)
+        QShortcut(QKeySequence(Qt.Key.Key_S), self, self.save_annotations)
+
+        # Undo/Redo keyboard shortcuts
+        QShortcut(QKeySequence("Ctrl+Z"), self, self.undo)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, self.redo)
+        QShortcut(QKeySequence("Ctrl+Y"), self, self.redo)
+
+    def push_undo(self):
+        """Saves a deep copy of the current annotations to the undo stack and clears the redo stack."""
+        import copy
+
+        state = copy.deepcopy(self.coco_data.get("annotations", []))
+        self.undo_stack.append(state)
+        if len(self.undo_stack) > self.max_history:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+        self.update_history_actions_state()
+
+    def undo(self):
+        """Reverts to the last saved state in the undo stack."""
+        if not self.undo_stack:
+            return
+        import copy
+
+        current_state = copy.deepcopy(self.coco_data.get("annotations", []))
+        self.redo_stack.append(current_state)
+
+        previous_state = self.undo_stack.pop()
+        self.coco_data["annotations"] = previous_state
+
+        # Re-build annotation map
+        self.img_ann_map.clear()
+        for ann in self.coco_data["annotations"]:
+            self.img_ann_map[ann["image_id"]] = ann
+
+        # Refresh UI and save
+        self.show_current_frame(preserve_view=True)
+        self.global_3d_bounds = self.calculate_global_3d_bounds()
+        self.update_3d_view()
+        self.save_annotations()
+        self.update_history_actions_state()
+
+    def redo(self):
+        """Restores the last undone state in the redo stack."""
+        if not self.redo_stack:
+            return
+        import copy
+
+        current_state = copy.deepcopy(self.coco_data.get("annotations", []))
+        self.undo_stack.append(current_state)
+
+        next_state = self.redo_stack.pop()
+        self.coco_data["annotations"] = next_state
+
+        # Re-build annotation map
+        self.img_ann_map.clear()
+        for ann in self.coco_data["annotations"]:
+            self.img_ann_map[ann["image_id"]] = ann
+
+        # Refresh UI and save
+        self.show_current_frame(preserve_view=True)
+        self.global_3d_bounds = self.calculate_global_3d_bounds()
+        self.update_3d_view()
+        self.save_annotations()
+        self.update_history_actions_state()
+
+    def update_history_actions_state(self):
+        """Enables/disables undo and redo buttons based on stack state."""
+        if hasattr(self, "btn_undo") and self.btn_undo:
+            self.btn_undo.setEnabled(len(self.undo_stack) > 0)
+        if hasattr(self, "btn_redo") and self.btn_redo:
+            self.btn_redo.setEnabled(len(self.redo_stack) > 0)
+
+    def apply_dark_style(self):
+        """Applies a premium, HSL tailored dark QSS style."""
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #090d16;
+            }
+            QWidget {
+                color: #f8fafc;
+                font-family: 'Segoe UI', Arial, sans-serif;
+            }
+            QDialog, QMessageBox, QFileDialog {
+                background-color: #0f172a;
+            }
+            QDialog QLabel, QMessageBox QLabel, QFileDialog QLabel {
+                color: #f8fafc;
+            }
+            QDialog QLineEdit, QFileDialog QLineEdit {
+                background-color: #1e293b;
+                color: #f8fafc;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QDialog QListView, QDialog QTreeView, QFileDialog QListView, QFileDialog QTreeView {
+                background-color: #090d16;
+                color: #f8fafc;
+                border: 1px solid #334155;
+            }
+            QDialog QHeaderView::section, QFileDialog QHeaderView::section {
+                background-color: #1e293b;
+                color: #f8fafc;
+                border: 1px solid #334155;
+            }
+            QDialog QComboBox, QFileDialog QComboBox {
+                background-color: #1e293b;
+                color: #f8fafc;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QDialog QComboBox QAbstractItemView, QFileDialog QComboBox QAbstractItemView {
+                background-color: #1e293b;
+                color: #f8fafc;
+            }
+            QPushButton {
+                background-color: #1e293b;
+                border: 1px solid #334155;
+                padding: 10px 15px;
+                border-radius: 6px;
+                font-weight: 500;
+                font-size: 13px;
+                color: #f8fafc;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                border-color: #475569;
+            }
+            QPushButton:pressed {
+                background-color: #0f172a;
+            }
+            QPushButton:disabled {
+                color: #475569;
+                background-color: #0f172a;
+                border-color: #1e293b;
+            }
+            QLabel {
+                font-size: 13px;
+            }
+            QStatusBar {
+                background-color: #0f172a;
+                color: #94a3b8;
+                border-top: 1px solid #1e293b;
+            }
+            QToolTip {
+                background-color: #0f172a;
+                color: #f8fafc;
+                border: 1px solid #334155;
+                padding: 5px;
+                border-radius: 4px;
+            }
+        """)
+
+    def prompt_select_sequence(self):
+        """Open a single file dialog to select multiple camera directories."""
+        initial_dir = "/usagers4/p123652/Documents/annotator/Data"
+        if not os.path.exists(initial_dir):
+            initial_dir = "/usagers4/p123652/Documents/annotator"
+        if not os.path.exists(initial_dir):
+            initial_dir = os.path.expanduser("~")
+
+        selected_paths = select_multiple_directories(
+            self, "Select 8 Camera Folders", initial_dir
+        )
+        if not selected_paths:
+            self.status_bar.showMessage("Sequence loading cancelled.")
+            return
+
+        # Attempt to map selected folders (could be 1 or more) to the 8 camera keys
+        matched = {}
+        unmatched = list(selected_paths)
+
+        # Pass 1: exact or clean substring matches
+        for key in CAMERA_KEYS:
+            for path in list(unmatched):
+                basename = os.path.basename(path).lower()
+                key_clean = key.lower().replace("_", "").replace("-", "")
+                base_clean = basename.replace("_", "").replace("-", "")
+                if key.lower() in basename or key_clean in base_clean:
+                    matched[key] = path
+                    unmatched.remove(path)
+                    break
+
+        # Pass 2: map by camera number index
+        for key in CAMERA_KEYS:
+            if key in matched:
+                continue
+            match_cam_num = re.search(r"camera(\d+)", key.lower())
+            if match_cam_num:
+                num = match_cam_num.group(1)
+                for path in list(unmatched):
+                    basename = os.path.basename(path).lower()
+                    if (
+                        f"cam{num}" in basename
+                        or f"camera{num}" in basename
+                        or f"camera_{num}" in basename
+                        or f"cam_{num}" in basename
+                    ):
+                        matched[key] = path
+                        unmatched.remove(path)
+                        break
+
+        # If we matched all 8 cameras, we can load directly!
+        if len(matched) == len(CAMERA_KEYS):
+            all_valid = True
+            for path in matched.values():
+                try:
+                    files = os.listdir(path)
+                    if not any(
+                        f.lower().endswith((".png", ".jpg", ".jpeg")) for f in files
+                    ):
+                        all_valid = False
+                        break
+                except Exception:
+                    all_valid = False
+                    break
+            if all_valid:
+                self.camera_dirs = matched
+                first_dir = next(iter(self.camera_dirs.values()))
+                self.sequence_dir = os.path.dirname(first_dir)
+                self.load_sequence_from_dirs(self.camera_dirs)
+                return
+
+        # If some matched (but not all) or some are invalid, open the dialog pre-filled!
+        first_dir = selected_paths[0]
+        parent_est = os.path.dirname(first_dir)
+        dialog = SelectCameraFoldersDialog(
+            CAMERA_KEYS, initial_parent=parent_est, prefilled_dirs=matched, parent=self
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.camera_dirs = dialog.camera_dirs
+            first_dir = next(iter(self.camera_dirs.values()))
+            self.sequence_dir = os.path.dirname(first_dir)
+            self.load_sequence_from_dirs(self.camera_dirs)
+
+    def load_sequence_from_cli_paths(self, paths):
+        """Loads sequence directly from a list of folders (multiple camera folders) passed via CLI."""
+        if not paths:
+            self.prompt_select_sequence()
+            return
+
+        matched = {}
+        unmatched = list(paths)
+
+        # Pass 1: exact or clean substring matches
+        for key in CAMERA_KEYS:
+            for path in list(unmatched):
+                basename = os.path.basename(path).lower()
+                key_clean = key.lower().replace("_", "").replace("-", "")
+                base_clean = basename.replace("_", "").replace("-", "")
+                if key.lower() in basename or key_clean in base_clean:
+                    matched[key] = path
+                    unmatched.remove(path)
+                    break
+
+        # Pass 2: map by camera number index
+        for key in CAMERA_KEYS:
+            if key in matched:
+                continue
+            match_cam_num = re.search(r"camera(\d+)", key.lower())
+            if match_cam_num:
+                num = match_cam_num.group(1)
+                for path in list(unmatched):
+                    basename = os.path.basename(path).lower()
+                    if (
+                        f"cam{num}" in basename
+                        or f"camera{num}" in basename
+                        or f"camera_{num}" in basename
+                        or f"cam_{num}" in basename
+                    ):
+                        matched[key] = path
+                        unmatched.remove(path)
+                        break
+
+        # If we successfully matched all 8 cameras, we load directly!
+        if len(matched) == len(CAMERA_KEYS):
+            all_valid = True
+            for path in matched.values():
+                try:
+                    files = os.listdir(path)
+                    if not any(
+                        f.lower().endswith((".png", ".jpg", ".jpeg")) for f in files
+                    ):
+                        all_valid = False
+                        break
+                except Exception:
+                    all_valid = False
+                    break
+            if all_valid:
+                self.camera_dirs = matched
+                first_dir = next(iter(self.camera_dirs.values()))
+                self.sequence_dir = os.path.dirname(first_dir)
+                self.load_sequence_from_dirs(self.camera_dirs)
+                return
+
+        # If not all were matched or valid, show warning and return without loading
+        QMessageBox.warning(
+            self,
+            "Invalid Command Line Arguments",
+            "Please specify all 8 camera folders when launching via command line.\n\n"
+            "Example:\npython main.py Data/1_partie_0429_003*",
+        )
+        self.status_bar.showMessage(
+            "Failed to load sequence: invalid command line arguments."
+        )
+
+    def extract_frame_idx(self, filename):
+        """Extracts frame index from filename robustly."""
+        match = re.search(r"frame_(\d+)", filename)
+        if match:
+            return int(match.group(1))
+        match = re.search(r"(\d+)", filename)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def extract_video_id(self, paths):
+        """Extracts the video identifier (e.g. '003' or '006') from path names."""
+        for path in paths:
+            basename = os.path.basename(path)
+            match = re.search(r"_(\d+)-Camera", basename)
+            if match:
+                return match.group(1)
+            match = re.search(r"_(\d+)-", basename)
+            if match:
+                return match.group(1)
+            match = re.search(r"_(\d{3,})", basename)
+            if match:
+                return match.group(1)
+        return "000"
+
+    def load_sequence_from_dirs(self, camera_dirs):
+        """Scans separate camera directories and loads or initializes annotation_{video_id}.json in parent's GT/ directory."""
+        log_debug(f"load_sequence_from_dirs started, camera_dirs={camera_dirs}")
+        # Convert all paths to absolute paths for consistency
+        camera_dirs = {k: os.path.abspath(v) for k, v in camera_dirs.items()}
+        self.camera_dirs = camera_dirs
+
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.update_history_actions_state()
+
+        first_dir = next(iter(camera_dirs.values()))
+        self.sequence_dir = os.path.dirname(first_dir)
+        basename = os.path.basename(first_dir)
+        if "-Camera" in basename:
+            self.seq_name = basename.split("-Camera")[0]
+        else:
+            self.seq_name = basename
+
+        self.path_lbl.setText(self.sequence_dir)
+        self.trc_coords = None
+
+        self.json_path = None
+
+        self.status_bar.showMessage("Scanning camera directories...")
+        self.frame_data.clear()
+
+        for cam_key, cam_dir in camera_dirs.items():
+            if not os.path.isdir(cam_dir):
+                continue
+            try:
+                files = os.listdir(cam_dir)
+            except Exception as e:
+                print(f"Error listing {cam_dir}: {e}")
+                continue
+            for f in files:
+                if not (
+                    f.lower().endswith(".png")
+                    or f.lower().endswith(".jpg")
+                    or f.lower().endswith(".jpeg")
+                ):
+                    continue
+
+                frame_idx = self.extract_frame_idx(f)
+                if frame_idx is None:
+                    continue
+
+                if frame_idx not in self.frame_data:
+                    self.frame_data[frame_idx] = {}
+                self.frame_data[frame_idx][cam_key] = os.path.join(cam_dir, f)
+
+        # Keep frames present in at least one camera so frame indices align with TRC rows
+        self.frame_data = {
+            idx: cams
+            for idx, cams in self.frame_data.items()
+            if len(cams) >= 1
+        }
+        self.sorted_frames = sorted(list(self.frame_data.keys()))
+
+        if not self.sorted_frames:
+            QMessageBox.warning(
+                self,
+                "No frames found",
+                "No valid camera frames found inside the camera directories.",
+            )
+            return
+
+        self.coco_data = {
+            "images": [],
+            "annotations": [],
+            "categories": [{"id": 1, "name": "person"}],
+        }
+        self.img_ann_map.clear()
+        self.img_file_map.clear()
+
+        self.initialize_fresh_coco()
+
+        # Check if loaded sequence matches the last saved session
+        saved_settings = self.load_local_settings() or {}
+        saved_dirs = saved_settings.get("camera_dirs")
+        restore_frame_idx = 0
+        if (
+            isinstance(saved_dirs, dict)
+            and len(saved_dirs) == len(CAMERA_KEYS)
+            and all(
+                os.path.abspath(saved_dirs.get(k, ""))
+                == os.path.abspath(camera_dirs.get(k, ""))
+                for k in CAMERA_KEYS
+            )
+        ):
+            saved_frame_idx = saved_settings.get("current_frame_idx", 0)
+            if 0 <= saved_frame_idx < len(self.sorted_frames):
+                restore_frame_idx = saved_frame_idx
+
+        self.update_filtered_frames()
+        if self.sorted_frames:
+            self.slider_frame.setEnabled(True)
+            self.spin_frame.setEnabled(True)
+
+        self.current_frame_idx = restore_frame_idx
+
+        # Load predictions and TRC file
+        self.load_predictions_from_pickle()
+        self.load_trc_file()
+
+        self.show_current_frame()
+        self.global_3d_bounds = self.calculate_global_3d_bounds()
+
+        self.btn_preprocess_seq.setEnabled(True)
+        self.btn_clear_frame_ann.setEnabled(False)
+        self.btn_clear_frame_ann.hide()
+
+        # Defer zoom to bounding boxes until layout finishes resizing at startup or sequence load
+        QTimer.singleShot(0, self.zoom_all_bboxes)
+
+        log_debug("load_sequence_from_dirs completed successfully")
+
+    def load_predictions_from_pickle(self):
+        pkl_path = os.path.join(self.sequence_dir, "predictions.pkl")
+        if not os.path.exists(pkl_path):
+            pkl_path = os.path.join("output", self.seq_name, "predictions.pkl")
+        if not os.path.exists(pkl_path):
+            print("Predictions file not found:", pkl_path)
+            return
+
+        try:
+            import pickle
+            with open(pkl_path, "rb") as f:
+                preds = pickle.load(f)
+            print(f"[DEBUG] Loaded predictions from: {os.path.abspath(pkl_path)}")
+            if preds:
+                print(f"[DEBUG] First prediction img_path: {preds[0].get('img_path', 'N/A')}")
+                print(f"[DEBUG] Total predictions: {len(preds)}")
+
+            pred_lookup = {}
+            for res in preds:
+                img_path = res['img_path']
+                cam_name = os.path.basename(os.path.dirname(img_path))
+                filename = os.path.basename(img_path)
+                pred_lookup[(cam_name, filename)] = res
+
+            # Update COCO annotations
+            for frame_idx in self.sorted_frames:
+                for cam_key in CAMERA_KEYS:
+                    if cam_key in self.frame_data[frame_idx]:
+                        local_path = self.frame_data[frame_idx][cam_key]
+                        cam_name = os.path.basename(os.path.dirname(local_path))
+                        filename = os.path.basename(local_path)
+
+                        pred_data = pred_lookup.get((cam_name, filename))
+                        if pred_data and 'pred_instances' in pred_data:
+                            img_entry = self.img_file_map.get(local_path)
+                            if img_entry:
+                                ann = self.img_ann_map.get(img_entry["id"])
+                                if ann:
+                                    kps = np.array(pred_data['pred_instances'].get('keypoints', [[]])[0])
+                                    scores = np.array(pred_data['pred_instances'].get('keypoint_scores', [[]])[0])
+                                    bbox = pred_data['pred_instances'].get('bboxes', [[]])[0]
+
+                                    flat_kps = [0.0] * 51
+                                    for idx in range(17):
+                                        if idx < len(kps):
+                                            flat_kps[idx * 3] = float(kps[idx][0])
+                                            flat_kps[idx * 3 + 1] = float(kps[idx][1])
+                                            flat_kps[idx * 3 + 2] = float(scores[idx])
+                                    ann["keypoints"] = flat_kps
+                                    ann["num_keypoints"] = sum(1 for idx in range(17) if scores[idx] > 0.05)
+
+                                    if len(bbox) >= 4:
+                                        x1, y1, x2, y2 = bbox[:4]
+                                        if x2 > x1 and y2 > y1 and (x2 - x1 < 1920.0):
+                                            bbox = [x1, y1, x2 - x1, y2 - y1]
+                                    ann["bbox"] = list(bbox)
+            print("Successfully loaded 2D predictions from pickle.")
+        except Exception as e:
+            print("Error loading predictions from pickle:", e)
+
+    def load_trc_file(self):
+        """Loads either triangulated.trc or triangulated_kalman.trc depending on use_kalman_trc setting."""
+        self.trc_coords_kalman = None
+        self._cached_dynamic_kalman_coords = None
+        raw_trc_path = os.path.join(self.sequence_dir, "pose-3d", "triangulated.trc")
+        if not os.path.exists(raw_trc_path):
+            raw_trc_path = os.path.join("output", self.seq_name, "pose-3d", "triangulated.trc")
+        if not os.path.exists(raw_trc_path):
+            alt_dir = os.path.join("output", self.seq_name, "pose-3d")
+            if os.path.exists(alt_dir):
+                trc_files = [f for f in os.listdir(alt_dir) if f.endswith(".trc") and "kalman" not in f]
+                if trc_files:
+                    raw_trc_path = os.path.join(alt_dir, trc_files[0])
+                    
+        # Load raw TRC if not loaded yet
+        if os.path.exists(raw_trc_path):
+            try:
+                from read_trc_files import extract_coordinates
+                coords, frame_numbers, _, _ = extract_coordinates(raw_trc_path, to_mm=False, return_time=True)
+                self.trc_coords_raw = coords
+                self.trc_frame_numbers = frame_numbers
+                self.trc_path = raw_trc_path
+            except Exception as e:
+                print("Error loading raw TRC file:", e)
+
+        # Check for Kalman TRC in output/{seq_name}/pose-3d/triangulated_kalman.trc
+        kalman_trc_path = os.path.join("output", self.seq_name, "pose-3d", "triangulated_kalman.trc")
+        if not os.path.exists(kalman_trc_path) and self.sequence_dir:
+            kalman_trc_path = os.path.join(self.sequence_dir, "pose-3d", "triangulated_kalman.trc")
+
+        if self.use_kalman_trc and os.path.exists(kalman_trc_path):
+            try:
+                from read_trc_files import extract_coordinates
+                coords, _, _, _ = extract_coordinates(kalman_trc_path, to_mm=False, return_time=True)
+                self.trc_coords = coords
+                print(f"[TRC] Active 3D Trajectory: Kalman Smoothed -> {os.path.abspath(kalman_trc_path)}")
+            except Exception as e:
+                print("Error loading kalman TRC file:", e)
+                self.trc_coords = self.trc_coords_raw.copy() if self.trc_coords_raw is not None else None
+        else:
+            if self.trc_coords_raw is not None:
+                self.trc_coords = self.trc_coords_raw.copy()
+                print(f"[TRC] Active 3D Trajectory: Raw Triangulated -> {os.path.abspath(raw_trc_path)}")
+            else:
+                self.trc_coords = None
+
+        self.update_3d_view()
+
+    def initialize_fresh_coco(self):
+        """Initializes empty COCO dict structure mapping scanned local image files."""
+        json_name = (
+            os.path.basename(self.json_path) if self.json_path else "annotations.json"
+        )
+        self.status_bar.showMessage(f"Initializing new {json_name}...")
+        self.coco_data = {
+            "images": [],
+            "annotations": [],
+            "categories": [{"id": 1, "name": "person"}],
+        }
+        self.img_ann_map.clear()
+        self.img_file_map.clear()
+
+        img_id = 1
+        for frame_idx in self.sorted_frames:
+            for cam_key in CAMERA_KEYS:
+                if cam_key in self.frame_data[frame_idx]:
+                    file_path = self.frame_data[frame_idx][cam_key]
+                    img_entry = {
+                        "id": img_id,
+                        "file_name": file_path,
+                        "width": 1920,
+                        "height": 1080,
+                    }
+                    ann_entry = {
+                        "id": img_id,
+                        "image_id": img_id,
+                        "category_id": 1,
+                        "bbox": [0, 0, 0, 0],
+                        "keypoints": [0] * 51,
+                        "num_keypoints": 0,
+                        "iscrowd": 0,
+                    }
+                    self.coco_data["images"].append(img_entry)
+                    self.coco_data["annotations"].append(ann_entry)
+                    self.img_ann_map[img_id] = ann_entry
+                    self.img_file_map[file_path] = img_entry
+                    img_id += 1
+        self.status_bar.showMessage(f"New {json_name} initialized.", 3000)
+
+    def show_current_frame(self, preserve_view=False):
+        """Updates QGraphicsScene components on the 8 grid views."""
+        log_debug(
+            f"show_current_frame started, current_frame_idx={self.current_frame_idx}"
+        )
+        # Ensure current frame idx is snapped to the filtered list
+        if not hasattr(self, "filtered_frame_indices") or not self.filtered_frame_indices:
+            self.update_filtered_frames()
+
+        try:
+            p = self.filtered_frame_indices.index(self.current_frame_idx)
+        except ValueError:
+            self.current_frame_idx = self.snap_frame_idx(self.current_frame_idx)
+            try:
+                p = self.filtered_frame_indices.index(self.current_frame_idx)
+            except ValueError:
+                p = 0
+                self.current_frame_idx = self.filtered_frame_indices[0]
+
+        frame_idx = self.sorted_frames[self.current_frame_idx]
+        log_debug(f"show_current_frame frame_idx={frame_idx}")
+        self.frame_lbl.setText(
+            f"Frame: {p + 1} / {len(self.filtered_frame_indices)}"
+        )
+        self.lbl_total_frames.setText(f"/ {len(self.filtered_frame_indices)}")
+        self.status_bar.showMessage(f"Displaying frame index: {frame_idx}")
+
+        maximized_id = self.get_maximized_camera_id()
+        log_debug(f"show_current_frame maximized_id={maximized_id}")
+        for i, key in enumerate(CAMERA_KEYS):
+            cam_widget = self.camera_widgets[i]
+            log_debug(f"show_current_frame processing camera={key} (i={i})")
+            if key in self.frame_data[frame_idx]:
+                img_path = self.frame_data[frame_idx][key]
+                img_entry = self.img_file_map[img_path]
+                ann = self.img_ann_map[img_entry["id"]]
+                log_debug(
+                    f"show_current_frame calling load_frame for key={key}, img={img_path}"
+                )
+                cam_widget.load_frame(img_path, ann, preserve_view=preserve_view)
+                log_debug(f"show_current_frame load_frame done for key={key}")
+                if maximized_id is None or i == maximized_id:
+                    cam_widget.show()
+                else:
+                    cam_widget.hide()
+            else:
+                log_debug(f"show_current_frame key={key} missing from frame_data")
+                cam_widget.scene.clear()
+                cam_widget.resetTransform()
+                cam_widget.current_img_path = None
+                cam_widget.current_annotation = None
+                cam_widget.name_label.setText(key)
+                cam_widget.name_label.adjustSize()
+                txt_item = cam_widget.scene.addText(f"Missing frame data\nfor {key}")
+                txt_item.setDefaultTextColor(QColor(226, 232, 240))
+                from PyQt6.QtGui import QFont
+                font = QFont("Arial", 22)
+                font.setBold(True)
+                txt_item.setFont(font)
+                br = txt_item.boundingRect()
+                pad = 30
+                rect = QRectF(br.x() - pad, br.y() - pad, br.width() + 2 * pad, br.height() + 2 * pad)
+                cam_widget.scene.setSceneRect(rect)
+                cam_widget.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+                if maximized_id is None or i == maximized_id:
+                    cam_widget.show()
+                else:
+                    cam_widget.hide()
+
+        # Update sidebar state
+        log_debug("show_current_frame updating sidebar state")
+        self.update_active_widgets_state()
+
+        # Synchronize frame slider
+        log_debug("show_current_frame syncing frame slider")
+        self.slider_frame.blockSignals(True)
+        self.slider_frame.setRange(0, max(0, len(self.filtered_frame_indices) - 1))
+        self.slider_frame.setValue(p)
+        self.slider_frame.blockSignals(False)
+
+        # Synchronize frame spin box
+        log_debug("show_current_frame syncing frame spin box")
+        self.spin_frame.blockSignals(True)
+        self.spin_frame.setRange(1, max(1, len(self.filtered_frame_indices)))
+        self.spin_frame.setValue(p + 1)
+        self.spin_frame.blockSignals(False)
+
+        # Update 3D skeleton visualization
+        log_debug("show_current_frame updating 3D visualizer")
+        self.update_3d_view()
+
+        # Automatically persist settings (e.g. current_frame_idx)
+        log_debug("show_current_frame saving local settings")
+        self.save_local_settings()
+        log_debug("show_current_frame completed successfully")
+
+    def get_maximized_camera_id(self):
+        """Returns the ID of the maximized view, or None."""
+        for i, cam in enumerate(self.camera_widgets):
+            if cam.is_maximized:
+                return i
+        return None
+
+    def update_active_widgets_state(self):
+        """Enables/disables buttons depending on maximized state."""
+        maximized_id = self.get_maximized_camera_id()
+        if maximized_id is not None:
+            self.mode_lbl.setText(f"Maximized: {CAMERA_KEYS[maximized_id]}")
+            self.btn_prev_view.show()
+            self.btn_next_view.show()
+            self.btn_prev_view.setEnabled(maximized_id > 0)
+            self.btn_next_view.setEnabled(maximized_id < len(self.camera_widgets) - 1)
+        else:
+            self.mode_lbl.setText("Grid Mode (Double click view to zoom)")
+            self.btn_prev_view.hide()
+            self.btn_next_view.hide()
+
+        # Enable zoom all if a sequence is loaded and has frames
+        self.btn_zoom_all.setEnabled(
+            self.sequence_dir is not None and len(self.sorted_frames) > 0
+        )
+
+        # Update ViTPose and Triangulation buttons state on all camera views
+        worker_running = (
+            self.active_worker is not None and self.active_worker.isRunning()
+        )
+        self.set_vitpose_buttons_enabled(not worker_running)
+        self.set_triangulation_buttons_enabled(not worker_running)
+
+    def set_vitpose_buttons_enabled(self, enabled):
+        """Enables or disables the ViTPose button on all camera widgets."""
+        for cam in self.camera_widgets:
+            if hasattr(cam, "vitpose_btn") and cam.vitpose_btn:
+                cam.vitpose_btn.setEnabled(enabled)
+
+    def set_triangulation_buttons_enabled(self, enabled):
+        """Enables or disables the Triangulate button on all camera widgets."""
+        for cam in self.camera_widgets:
+            if hasattr(cam, "triangulate_btn") and cam.triangulate_btn:
+                cam.triangulate_btn.setEnabled(enabled)
+
+    def toggle_maximize_camera(self, cam_id):
+        """Maximizes double-clicked view to occupy full window space, or returns to grid."""
+        cam = self.camera_widgets[cam_id]
+        if not cam.is_maximized:
+            # Hide all other camera widgets
+            for i, c in enumerate(self.camera_widgets):
+                if i != cam_id:
+                    c.hide()
+            # Stretch selected widget across all grid coordinates
+            self.grid_layout.removeWidget(cam)
+            self.grid_layout.addWidget(cam, 0, 0, 2, 4)
+            cam.is_maximized = True
+
+            # Auto-zoom to bounding box if it already exists (deferred for layout resize)
+            QTimer.singleShot(0, cam.zoom_to_bbox)
+        else:
+            self.reset_camera_grid()
+
+        self.update_active_widgets_state()
+
+    def show_prev_camera_view(self):
+        """Switches to the previous camera view when maximized."""
+        maximized_id = self.get_maximized_camera_id()
+        if maximized_id is not None and maximized_id > 0:
+            self.switch_maximized_camera(maximized_id - 1)
+
+    def show_next_camera_view(self):
+        """Switches to the next camera view when maximized."""
+        maximized_id = self.get_maximized_camera_id()
+        if maximized_id is not None and maximized_id < len(self.camera_widgets) - 1:
+            self.switch_maximized_camera(maximized_id + 1)
+
+    def switch_maximized_camera(self, new_id):
+        """Transitions the maximized state from the current view to a new view."""
+        maximized_id = self.get_maximized_camera_id()
+        if maximized_id is not None:
+            old_cam = self.camera_widgets[maximized_id]
+            self.grid_layout.removeWidget(old_cam)
+            self.grid_layout.addWidget(
+                old_cam, maximized_id // 4, maximized_id % 4, 1, 1
+            )
+            old_cam.is_maximized = False
+
+        new_cam = self.camera_widgets[new_id]
+        for i, c in enumerate(self.camera_widgets):
+            if i != new_id:
+                c.hide()
+            else:
+                c.show()
+
+        self.grid_layout.removeWidget(new_cam)
+        self.grid_layout.addWidget(new_cam, 0, 0, 2, 4)
+        new_cam.is_maximized = True
+
+        QTimer.singleShot(0, new_cam.zoom_to_bbox)
+        self.update_active_widgets_state()
+
+    def reset_camera_grid(self):
+        """Resets the layout back to a 4x2 grid display."""
+        maximized_id = self.get_maximized_camera_id()
+        if maximized_id is not None:
+            cam = self.camera_widgets[maximized_id]
+            self.grid_layout.removeWidget(cam)
+            # Explicitly add back with 1 row span and 1 column span
+            self.grid_layout.addWidget(cam, maximized_id // 4, maximized_id % 4, 1, 1)
+            cam.is_maximized = False
+
+            # Show other widgets
+            for c in self.camera_widgets:
+                c.show()
+
+            # Defer zoom to bounding boxes until layout finishes resizing
+            QTimer.singleShot(0, self.zoom_all_bboxes)
+
+            self.update_active_widgets_state()
+
+    def zoom_active_bbox(self):
+        """Zoom active view onto bounding box."""
+        maximized_id = self.get_maximized_camera_id()
+        if maximized_id is not None:
+            self.camera_widgets[maximized_id].zoom_to_bbox()
+
+    def zoom_all_bboxes(self):
+        """Forces all 8 camera views to bbox mode and applies zoom/rotate to their bboxes."""
+        for cam in self.camera_widgets:
+            cam.zoom_to_bbox()
+
+    def update_bbox(self, cam_id, bbox_coords, preserve_view=True):
+        """Stores a bounding box into the memory model."""
+        self.push_undo()
+        frame_idx = self.sorted_frames[self.current_frame_idx]
+        cam_key = CAMERA_KEYS[cam_id]
+        if cam_key not in self.frame_data[frame_idx]:
+            return
+        img_path = self.frame_data[frame_idx][cam_key]
+        img_id = self.img_file_map[img_path]["id"]
+
+        ann = self.img_ann_map[img_id]
+        ann["bbox"] = bbox_coords
+        self.update_active_widgets_state()
+        self.save_annotations()
+        self.status_bar.showMessage(
+            f"Updated bbox for camera {cam_id}: {bbox_coords}", 2000
+        )
+
+        # Refresh camera widget
+        cam_widget = self.camera_widgets[cam_id]
+        cam_widget.load_frame(img_path, ann, preserve_view=preserve_view)
+
+    def update_keypoint(self, cam_id, point_id, x, y, save_and_sync=True):
+        """Updates coordinates of keypoint and marks it as manually confirmed (v=2)."""
+        frame_idx = self.sorted_frames[self.current_frame_idx]
+        cam_key = CAMERA_KEYS[cam_id]
+        if cam_key not in self.frame_data[frame_idx]:
+            return
+        img_path = self.frame_data[frame_idx][cam_key]
+        img_id = self.img_file_map[img_path]["id"]
+
+        ann = self.img_ann_map[img_id]
+        offset = point_id * 3
+        ann["keypoints"][offset] = float(x)
+        ann["keypoints"][offset + 1] = float(y)
+        ann["keypoints"][offset + 2] = 2  # Mark as manual adjustment
+
+        # Calculate total annotated points
+        ann["num_keypoints"] = sum(
+            1 for idx in range(17) if ann["keypoints"][idx * 3 + 2] > 0
+        )
+        if save_and_sync:
+            self.save_annotations()
+            self.update_3d_view()
+
+    def trigger_yolo_vitpose(self, camera_id=None):
+        """Triggers the background thread to run ViTPose on the specified camera's bounding box."""
+        if camera_id is False or camera_id is None:
+            camera_id = self.get_maximized_camera_id()
+        if camera_id is None:
+            return
+
+        if self.active_worker and self.active_worker.isRunning():
+            self.status_bar.showMessage("A computation task is already in progress.")
+            return
+
+        frame_idx = self.sorted_frames[self.current_frame_idx]
+        cam_key = CAMERA_KEYS[camera_id]
+        if cam_key not in self.frame_data[frame_idx]:
+            return
+        img_path = self.frame_data[frame_idx][cam_key]
+        img_entry = self.img_file_map[img_path]
+        ann = self.img_ann_map[img_entry["id"]]
+        bbox = ann.get("bbox", [0, 0, 0, 0])
+
+        if not bbox or len(bbox) != 4 or bbox[2] <= 0 or bbox[3] <= 0:
+            QMessageBox.warning(
+                self,
+                "No Bounding Box",
+                f"Please draw a bounding box first (Shift + Drag) on camera {camera_id + 1}.",
+            )
+            return
+
+        self.status_bar.showMessage(
+            f"Running ViTPose on camera {camera_id} in background..."
+        )
+        self.set_triangulation_buttons_enabled(False)
+        self.update_active_widgets_state()
+
+        # Start background worker
+        self.active_worker = WorkerThread(
+            task_type="vitpose_only",
+            model_wrapper=self.model_wrapper,
+            args={
+                "image_path": img_path,
+                "camera_id": camera_id,
+                "bbox": bbox,
+                "threshold": getattr(self, "vitpose_threshold", 0.3),
+            },
+        )
+        self.active_worker.finished.connect(self.on_yolo_vitpose_finished)
+        self.active_worker.error.connect(self.on_worker_error)
+        self.active_worker.start()
+
+    def on_yolo_vitpose_finished(self, result):
+        """Receives inference results from QThread and updates graphics scene."""
+        cam_id = result["camera_id"]
+        bbox = result["bbox"]
+        keypoints = result["keypoints"]
+
+        self.status_bar.showMessage(f"Inference completed for camera {cam_id}.", 3000)
+        self.set_triangulation_buttons_enabled(True)
+        self.update_active_widgets_state()
+
+        # 1. Update bbox in model
+        self.push_undo()
+        frame_idx = self.sorted_frames[self.current_frame_idx]
+        cam_key = CAMERA_KEYS[cam_id]
+        img_path = self.frame_data[frame_idx][cam_key]
+        img_entry = self.img_file_map[img_path]
+        ann = self.img_ann_map[img_entry["id"]]
+        ann["bbox"] = bbox
+
+        # 2. Update keypoints in model
+        if keypoints:
+            flat_kps = []
+            for kp in keypoints:
+                flat_kps.extend(kp)
+            ann["keypoints"] = flat_kps
+            ann["num_keypoints"] = sum(
+                1 for idx in range(17) if flat_kps[idx * 3 + 2] > 0
+            )
+
+        self.save_annotations()
+        # 3. Update 3D triangulation and show new keypoints and reprojections across all 8 views
+        self.update_3d_view()
+        self.show_current_frame(preserve_view=False)
+        self.zoom_all_bboxes()
+
+    def on_worker_error(self, err_msg):
+        self.status_bar.showMessage(f"Error: {err_msg}", 5000)
+        QMessageBox.critical(
+            self, "Model Error", f"An error occurred during inference:\n{err_msg}"
+        )
+        self.set_triangulation_buttons_enabled(True)
+        self.update_active_widgets_state()
+
+    def triangulate_view(self, cam_id):
+        """Runs triangulation on other views and places/projects the resulting points on this camera view."""
+        if self.active_worker and self.active_worker.isRunning():
+            return
+
+        self.push_undo()
+        frame_idx = self.sorted_frames[self.current_frame_idx]
+
+        # 1. Collect keypoints from all cameras
+        keypoints_data = {}
+        for c_id, key in enumerate(CAMERA_KEYS):
+            if key in self.frame_data[frame_idx]:
+                img_path = self.frame_data[frame_idx][key]
+                img_id = self.img_file_map[img_path]["id"]
+                flat_kps = self.img_ann_map[img_id]["keypoints"]
+                kps = []
+                for i in range(17):
+                    kps.append(
+                        [flat_kps[i * 3], flat_kps[i * 3 + 1], flat_kps[i * 3 + 2]]
+                    )
+                keypoints_data[c_id] = kps
+            else:
+                keypoints_data[c_id] = [[0.0, 0.0, 0]] * 17
+
+        # 2. Build list of projection matrices
+        matrices_list = []
+        for key in CAMERA_KEYS:
+            if key in self.camera_matrices:
+                matrices_list.append(self.camera_matrices[key])
+            else:
+                matrices_list.append([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]])
+
+        # 3. Perform triangulation and project onto target cam_id
+        # We want to use all other cameras to perform the triangulation for cam_id
+        updated_count = 0
+        target_key = CAMERA_KEYS[cam_id]
+        if target_key in self.frame_data[frame_idx]:
+            img_path = self.frame_data[frame_idx][target_key]
+            img_id = self.img_file_map[img_path]["id"]
+            ann = self.img_ann_map[img_id]
+            flat_kps = list(ann["keypoints"])
+
+            for kp_idx in range(17):
+                # Identify other cameras with valid annotations for this keypoint
+                base_cams = []
+                for c_id in range(8):
+                    if c_id != cam_id:
+                        kp = keypoints_data[c_id][kp_idx]
+                        if kp[2] > 0:
+                            base_cams.append(c_id)
+
+                if len(base_cams) < 2:
+                    continue
+
+                # Build SVD matrix A from other views
+                A = []
+                for c_id in base_cams:
+                    P = np.array(matrices_list[c_id])
+                    u, v, _ = keypoints_data[c_id][kp_idx]
+
+                    # Undistort
+                    key = CAMERA_KEYS[c_id]
+                    model_key = key.split("_")[1] if "_" in key else key
+                    if self.calib_data and model_key in self.calib_data:
+                        K = np.array(
+                            self.calib_data[model_key]["matrix"], dtype=np.float32
+                        )
+                        distortions = np.array(
+                            self.calib_data[model_key]["distortions"], dtype=np.float32
+                        )
+                        pt = np.array([[[u, v]]], dtype=np.float32)
+                        undistorted_pt = cv2.undistortPoints(
+                            pt, K, distortions, R=None, P=K
+                        )
+                        u, v = undistorted_pt[0, 0]
+
+                    A.append(u * P[2, :] - P[0, :])
+                    A.append(v * P[2, :] - P[1, :])
+
+                valid = False
+                A = np.array(A)
+                _, _, Vt = np.linalg.svd(A)
+                X = Vt[-1, :]
+                if abs(X[3]) > 1e-5:
+                    X = X / X[3]
+                    X_3d = X[:3]
+                    if np.all(np.abs(X_3d) < 50.0):
+                        # Project back onto target camera cam_id
+                        target_model_key = (
+                            target_key.split("_")[1]
+                            if "_" in target_key
+                            else target_key
+                        )
+                        if self.calib_data and target_model_key in self.calib_data:
+                            K = np.array(
+                                self.calib_data[target_model_key]["matrix"],
+                                dtype=np.float32,
+                            )
+                            distortions = np.array(
+                                self.calib_data[target_model_key]["distortions"],
+                                dtype=np.float32,
+                            )
+                            rvec = np.array(
+                                self.calib_data[target_model_key]["rotation"],
+                                dtype=np.float32,
+                            )
+                            tvec = np.array(
+                                self.calib_data[target_model_key]["translation"],
+                                dtype=np.float32,
+                            )
+
+                            # Convert Pose2Sim coordinates to calibration world coordinates
+                            # Verified mapping: X_world = Z_trc, Y_world = X_trc, Z_world = Y_trc
+                            X_3d_world = np.zeros_like(X_3d)
+                            X_3d_world[0] = X_3d[2]
+                            X_3d_world[1] = X_3d[0]
+                            X_3d_world[2] = X_3d[1]
+
+                            img_pts, _ = cv2.projectPoints(
+                                X_3d_world.reshape(1, 3), rvec, tvec, K, distortions
+                            )
+                            u_proj, v_proj = img_pts[0, 0]
+                            valid = True
+                        else:
+                            P = np.array(matrices_list[cam_id])
+                            X_homog = np.array([X_3d[0], X_3d[1], X_3d[2], 1.0])
+                            x_proj = P @ X_homog
+                            if x_proj[2] != 0:
+                                u_proj = x_proj[0] / x_proj[2]
+                                v_proj = x_proj[1] / x_proj[2]
+                                valid = True
+                            else:
+                                valid = False
+
+                if valid and 0.0 <= u_proj <= 1920.0 and 0.0 <= v_proj <= 1080.0:
+                    flat_kps[kp_idx * 3] = float(u_proj)
+                    flat_kps[kp_idx * 3 + 1] = float(v_proj)
+                    flat_kps[kp_idx * 3 + 2] = (
+                        2.0  # Labeled/confirmed via triangulation
+                    )
+                    updated_count += 1
+
+            if updated_count > 0:
+                ann["keypoints"] = flat_kps
+                ann["num_keypoints"] = sum(
+                    1 for idx in range(17) if flat_kps[idx * 3 + 2] > 0
+                )
+                self.camera_widgets[cam_id].load_frame(img_path, ann)
+                self.save_annotations()
+                self.global_3d_bounds = self.calculate_global_3d_bounds()
+                self.update_3d_view()
+                self.status_bar.showMessage(
+                    f"Triangulated and placed {updated_count} points on view {cam_id}.",
+                    3000,
+                )
+            else:
+                self.status_bar.showMessage(
+                    "Could not triangulate any points (need 2+ other views annotated).",
+                    3000,
+                )
+
+    def run_sequence_preprocessing(self, start_frame_idx=None, frame_step=None, preprocess_mode=None):
+        if not self.sorted_frames:
+            QMessageBox.warning(self, "No Sequence", "Please load a sequence first.")
+            return
+
+        self.btn_preprocess_seq.setEnabled(False)
+        self.progress_dialog = QProgressDialog(
+            "Initializing pipeline...", "Cancel", 0, 100, self
+        )
+        self.progress_dialog.setWindowTitle("Pre-processing Sequence & Triangulation")
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.setValue(0)
+
+        # Setup process
+        from PyQt6.QtCore import QProcess, QProcessEnvironment
+        self.preprocess_process = QProcess(self)
+        self.preprocess_process.setWorkingDirectory(".")
+
+        python_bin = "/usagers4/p123652/miniconda3/envs/mmpose_env/bin/python"
+        cams_args = list(self.camera_dirs.values())
+
+        script_path = "src/utils/generate_predictions.py"
+        args = ["-u", script_path] + cams_args
+        if getattr(self, "gt_path", None):
+            args.extend(["--gt", self.gt_path])
+
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+        self.preprocess_process.setProcessEnvironment(env)
+
+        self.preprocess_process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        self.preprocess_process.readyReadStandardOutput.connect(self.handle_preprocess_stdout)
+        self.preprocess_process.readyReadStandardError.connect(self.handle_preprocess_stderr)
+        self.preprocess_process.finished.connect(self.on_preprocess_pipeline_finished)
+
+        self.progress_dialog.canceled.connect(self.preprocess_process.kill)
+
+        self.preprocess_process.start(python_bin, args)
+
+    def handle_preprocess_stdout(self):
+        data = self.preprocess_process.readAllStandardOutput().data().decode('utf-8', errors='ignore')
+        sys.stdout.write(data)
+        sys.stdout.flush()
+        self.parse_preprocess_progress(data)
+
+    def handle_preprocess_stderr(self):
+        data = self.preprocess_process.readAllStandardError().data().decode('utf-8', errors='ignore')
+        sys.stderr.write(data)
+        sys.stderr.flush()
+        self.parse_preprocess_progress(data)
+
+    def parse_preprocess_progress(self, text):
+        import re
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            yolo_match = re.search(r"\[YOLO\].*?batch\s*(\d+)/(\d+)", line)
+            if yolo_match:
+                curr = int(yolo_match.group(1))
+                total = int(yolo_match.group(2))
+                val = int((curr / total) * 35)
+                self.progress_dialog.setValue(val)
+                self.progress_dialog.setLabelText(f"Étape 1/3 : Détection YOLO (Lot {curr}/{total})...")
+                continue
+            mmpose_match = re.search(r"Epoch\(test\)\s*\[\s*(\d+)/\s*(\d+)\]", line)
+            if mmpose_match:
+                curr = int(mmpose_match.group(1))
+                total = int(mmpose_match.group(2))
+                val = 35 + int((curr / total) * 55)
+                self.progress_dialog.setValue(val)
+                self.progress_dialog.setLabelText(f"Étape 2/3 : Pose Estimation ViTPose ({curr}/{total} images)...")
+                continue
+            if "Running Pose2Sim Triangulation" in line:
+                self.progress_dialog.setValue(95)
+                self.progress_dialog.setLabelText("Étape 3/3 : Triangulation Pose2Sim...")
+                continue
+
+    def on_preprocess_pipeline_finished(self, exit_code, exit_status):
+        self.btn_preprocess_seq.setEnabled(True)
+        if self.progress_dialog:
+            self.progress_dialog.close()
+
+        if exit_code == 0:
+            self.load_predictions_from_pickle()
+            self.load_trc_file()
+            self.show_current_frame()
+            self.global_3d_bounds = self.calculate_global_3d_bounds()
+            QMessageBox.information(
+                self,
+                "Success",
+                "Sequence preprocessing and Pose2Sim triangulation completed successfully!"
+            )
+        else:
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Preprocessing failed with exit code {exit_code}."
+            )
+
+    def prev_frame(self):
+        """Navigate to previous frame."""
+        if self.active_worker and self.active_worker.isRunning():
+            return
+        if not hasattr(self, "filtered_frame_indices") or not self.filtered_frame_indices:
+            self.update_filtered_frames()
+        try:
+            p = self.filtered_frame_indices.index(self.current_frame_idx)
+        except ValueError:
+            p = 0
+        if p > 0:
+            self.current_frame_idx = self.filtered_frame_indices[p - 1]
+            self.show_current_frame()
+
+    def next_frame(self):
+        """Navigate to next frame."""
+        if self.active_worker and self.active_worker.isRunning():
+            return
+        if not hasattr(self, "filtered_frame_indices") or not self.filtered_frame_indices:
+            self.update_filtered_frames()
+        try:
+            p = self.filtered_frame_indices.index(self.current_frame_idx)
+        except ValueError:
+            p = 0
+        if p < len(self.filtered_frame_indices) - 1:
+            self.current_frame_idx = self.filtered_frame_indices[p + 1]
+            self.show_current_frame()
+
+    def save_annotations(self):
+        """Saves current annotations into the JSON file (Disabled in read-only dashboard)."""
+        return
+
+    def update_nav_mode_button_ui(self):
+        """Updates the text and icon of the navigation mode button."""
+        mode = getattr(self, "navigation_mode", "all")
+        if mode == "all":
+            self.btn_nav_mode.setText("All Frames")
+            self.btn_nav_mode.setIcon(get_lucide_icon("eye", color="#ffffff"))
+        elif mode == "annotate":
+            self.btn_nav_mode.setText("Stepped Frames")
+            self.btn_nav_mode.setIcon(get_lucide_icon("pencil", color="#ffffff"))
+        elif mode == "interpolated":
+            self.btn_nav_mode.setText("Interpolated")
+            self.btn_nav_mode.setIcon(get_lucide_icon("chart-spline", color="#ffffff"))
+
+    def update_filtered_frames(self):
+        """Updates the active list of frame indices according to the navigation mode."""
+        mode = getattr(self, "navigation_mode", "all")
+        if not self.sorted_frames:
+            self.filtered_frame_indices = []
+            return
+
+        if mode == "all":
+            self.filtered_frame_indices = list(range(len(self.sorted_frames)))
+        elif mode == "annotate":
+            self.filtered_frame_indices = [
+                i for i in range(self.start_frame_idx, len(self.sorted_frames), self.frame_step)
+            ]
+        elif mode == "interpolated":
+            self.filtered_frame_indices = [
+                i for i in range(len(self.sorted_frames))
+                if i < self.start_frame_idx or (i - self.start_frame_idx) % self.frame_step != 0
+            ]
+
+        if not self.filtered_frame_indices:
+            self.filtered_frame_indices = [0]
+
+    def set_navigation_mode(self, mode):
+        """Sets the active navigation mode, snaps position, and saves settings."""
+        self.navigation_mode = mode
+        self.update_nav_mode_button_ui()
+        self.update_filtered_frames()
+        self.current_frame_idx = self.snap_frame_idx(self.current_frame_idx)
+        self.show_current_frame()
+        self.save_local_settings()
+
+    def is_interpolated_frame(self, idx):
+        """Returns True if the frame at idx is an interpolated (intermediate) frame."""
+        if getattr(self, "frame_step", 1) <= 1:
+            return False
+        return idx < self.start_frame_idx or (idx - self.start_frame_idx) % self.frame_step != 0
+
+    def get_nearest_interpolated_frame_idx(self, idx):
+        """Scans the sequence to find the closest intermediate (interpolated) frame index."""
+        if not self.sorted_frames or getattr(self, "frame_step", 1) <= 1:
+            return idx
+        best_idx = idx
+        min_dist = float('inf')
+        for i in range(len(self.sorted_frames)):
+            if self.is_interpolated_frame(i):
+                dist = abs(i - idx)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_idx = i
+        return best_idx
+
+    def get_nearest_step_frame_idx(self, idx):
+        """Returns the nearest step frame index to idx."""
+        if getattr(self, "frame_step", 1) <= 1:
+            return idx
+        if idx < self.start_frame_idx:
+            return self.start_frame_idx
+        k = round((idx - self.start_frame_idx) / self.frame_step)
+        candidate = self.start_frame_idx + k * self.frame_step
+        max_idx = len(self.sorted_frames) - 1
+        if candidate > max_idx:
+            candidate = self.start_frame_idx + ((max_idx - self.start_frame_idx) // self.frame_step) * self.frame_step
+        return max(self.start_frame_idx, candidate)
+
+    def snap_frame_idx(self, idx):
+        """Snaps the frame index according to the current navigation mode."""
+        if getattr(self, "navigation_mode", "all") == "annotate" and getattr(self, "frame_step", 1) > 1:
+            return self.get_nearest_step_frame_idx(idx)
+        elif getattr(self, "navigation_mode", "all") == "interpolated":
+            return self.get_nearest_interpolated_frame_idx(idx)
+        return idx
+
+    def interpolate_annotations(self):
+        """Linearly interpolates bounding boxes and keypoints for intermediate frames."""
+        if not self.sorted_frames or not self.coco_data:
+            return
+        if getattr(self, "frame_step", 1) <= 1:
+            return
+
+        for cam_key in CAMERA_KEYS:
+            step_valid_indices = []
+            for i, frame_idx in enumerate(self.sorted_frames):
+                is_step = (i >= self.start_frame_idx and (i - self.start_frame_idx) % self.frame_step == 0)
+                path = self.frame_data[frame_idx].get(cam_key)
+                if path:
+                    img_entry = self.img_file_map.get(path)
+                    if img_entry:
+                        ann = self.img_ann_map.get(img_entry["id"])
+                        if ann and ann.get("bbox") and len(ann["bbox"]) == 4 and ann["bbox"][2] > 0 and ann["bbox"][3] > 0:
+                            kps = ann.get("keypoints", [])
+                            has_manual_kps = any(kps[idx * 3 + 2] == 2 for idx in range(17)) if kps else False
+                            if is_step or has_manual_kps:
+                                step_valid_indices.append(i)
+
+            if len(step_valid_indices) < 2:
+                continue
+
+            for k in range(len(step_valid_indices) - 1):
+                idx1 = step_valid_indices[k]
+                idx2 = step_valid_indices[k+1]
+
+                for i in range(idx1 + 1, idx2):
+                    t = (i - idx1) / (idx2 - idx1)
+                    frame_idx = self.sorted_frames[i]
+                    path = self.frame_data[frame_idx].get(cam_key)
+                    if not path:
+                        continue
+                    img_entry = self.img_file_map.get(path)
+                    if not img_entry:
+                        continue
+                    ann = self.img_ann_map.get(img_entry["id"])
+                    if not ann:
+                        continue
+
+                    path1 = self.frame_data[self.sorted_frames[idx1]][cam_key]
+                    img_entry1 = self.img_file_map[path1]
+                    ann1 = self.img_ann_map[img_entry1["id"]]
+
+                    path2 = self.frame_data[self.sorted_frames[idx2]][cam_key]
+                    img_entry2 = self.img_file_map[path2]
+                    ann2 = self.img_ann_map[img_entry2["id"]]
+
+                    bbox1 = ann1["bbox"]
+                    bbox2 = ann2["bbox"]
+                    ann["bbox"] = [
+                        (1 - t) * bbox1[0] + t * bbox2[0],
+                        (1 - t) * bbox1[1] + t * bbox2[1],
+                        (1 - t) * bbox1[2] + t * bbox2[2],
+                        (1 - t) * bbox1[3] + t * bbox2[3],
+                    ]
+
+                    kp1 = ann1.get("keypoints", [0]*51)
+                    kp2 = ann2.get("keypoints", [0]*51)
+                    interp_kp = [0] * 51
+                    num_kp = 0
+                    for kp_idx in range(17):
+                        x1, y1, v1 = kp1[kp_idx*3], kp1[kp_idx*3+1], kp1[kp_idx*3+2]
+                        x2, y2, v2 = kp2[kp_idx*3], kp2[kp_idx*3+1], kp2[kp_idx*3+2]
+
+                        if v1 > 0 and v2 > 0:
+                            x = (1 - t) * x1 + t * x2
+                            y = (1 - t) * y1 + t * y2
+                            v = 1
+                            interp_kp[kp_idx*3] = x
+                            interp_kp[kp_idx*3+1] = y
+                            interp_kp[kp_idx*3+2] = v
+                            num_kp += 1
+                    ann["keypoints"] = interp_kp
+                    ann["num_keypoints"] = num_kp
+
+    def update_keypoint_sizes(self, value):
+        """Updates the visual size of keypoint markers in all graphics scenes."""
+        self.keypoint_radius = value
+        from items import ReprojectedPointItem
+
+        for cam in self.camera_widgets:
+            for kp in cam.keypoint_items.values():
+                kp.set_radius(value)
+            for item in cam.scene.items():
+                if isinstance(item, ReprojectedPointItem):
+                    item.set_radius(value)
+        self.save_local_settings()
+
+    def on_slider_frame_changed(self, value):
+        """Called when the user drags the frame slider."""
+        if not hasattr(self, "filtered_frame_indices") or not self.filtered_frame_indices:
+            return
+        if 0 <= value < len(self.filtered_frame_indices):
+            target_idx = self.filtered_frame_indices[value]
+            if self.current_frame_idx != target_idx:
+                self.current_frame_idx = target_idx
+                self.show_current_frame()
+
+    def on_spin_frame_changed(self, value):
+        """Called when the user types/changes the frame number in the spin box."""
+        if not hasattr(self, "filtered_frame_indices") or not self.filtered_frame_indices:
+            return
+        new_pos = value - 1
+        if 0 <= new_pos < len(self.filtered_frame_indices):
+            target_idx = self.filtered_frame_indices[new_pos]
+            if self.current_frame_idx != target_idx:
+                self.current_frame_idx = target_idx
+                self.show_current_frame()
+
+    def show_settings(self):
+        """Displays the settings dialog and updates views on change."""
+        dialog = SettingsDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_val = dialog.chk_rotate.isChecked()
+            if new_val != self.auto_rotate_enabled:
+                self.auto_rotate_enabled = new_val
+                # Refresh all views to apply or remove rotation
+                for cam in self.camera_widgets:
+                    if cam.view_mode == "bbox":
+                        cam.apply_bbox_view()
+
+    def show_kalman_dialog(self):
+        """Displays the dedicated Kalman Filter settings dialog."""
+        dialog = KalmanSettingsDialog(self)
+        dialog.exec()
+
+    def toggle_3d_window(self):
+        """Toggles visibility of the pop-out 3D visualizer window."""
+        if self.visualizer_3d_window is None:
+            self.visualizer_3d_window = Visualizer3DWindow(self)
+
+        if self.visualizer_3d_window.isVisible():
+            self.visualizer_3d_window.hide()
+        else:
+            total = len(self.sorted_frames) if self.sorted_frames else 0
+            self.visualizer_3d_window.playback_slider.setRange(0, max(0, total - 1))
+            self.visualizer_3d_window.playback_slider.setEnabled(total > 0)
+            self.visualizer_3d_window.btn_play_pause.setEnabled(total > 0)
+            self.visualizer_3d_window.sync_to_annotator_frame()
+            self.visualizer_3d_window.show()
+
+    def update_3d_view(self):
+        """Calculates 3D points and updates the inline plot and the 3D window if visible."""
+        log_debug("update_3d_view started")
+        pts_3d = self.calculate_3d_keypoints()
+        log_debug("update_3d_view calculate_3d_keypoints done")
+        if hasattr(self, "visualizer_3d_inline") and self.visualizer_3d_inline:
+            log_debug("update_3d_view calling update_plot on inline visualizer")
+            self.visualizer_3d_inline.update_plot(pts_3d)
+            log_debug("update_3d_view update_plot on inline visualizer done")
+        if self.visualizer_3d_window and self.visualizer_3d_window.isVisible():
+            log_debug("update_3d_view 3D window is visible")
+            if self.visualizer_3d_window.play_timer.isActive():
+                log_debug("update_3d_view updating 3D window visualization (playing)")
+                self.visualizer_3d_window.update_visualization()
+            elif self.visualizer_3d_window.playback_frame_idx != self.current_frame_idx:
+                log_debug("update_3d_view syncing 3D window to annotator frame")
+                self.visualizer_3d_window.sync_to_annotator_frame()
+            else:
+                log_debug("update_3d_view updating 3D window visualization")
+                self.visualizer_3d_window.update_visualization()
+        log_debug("update_3d_view completed successfully")
+
+    def calculate_3d_keypoints(self, frame_idx_in_list=None):
+        """Calculates 3D coordinates for all 17 keypoints of the current or specified frame."""
+        if frame_idx_in_list is None:
+            frame_idx_in_list = self.current_frame_idx
+
+        if (
+            frame_idx_in_list < 0
+            or not self.sorted_frames
+            or frame_idx_in_list >= len(self.sorted_frames)
+        ):
+            return None
+
+        # Return Pose2Sim TRC coordinates if loaded
+        if getattr(self, "trc_coords", None) is not None:
+            if 0 <= frame_idx_in_list < len(self.trc_coords):
+                return self.trc_coords[frame_idx_in_list]
+            return None
+
+    def calculate_raw_3d_keypoints(self, frame_idx_in_list=None):
+        """Calculates or retrieves RAW unsmoothed 3D triangulation coordinates for a given frame."""
+        if frame_idx_in_list is None:
+            frame_idx_in_list = self.current_frame_idx
+
+        if (
+            frame_idx_in_list < 0
+            or not self.sorted_frames
+            or frame_idx_in_list >= len(self.sorted_frames)
+        ):
+            return None
+
+        if getattr(self, "trc_coords_raw", None) is not None:
+            if 0 <= frame_idx_in_list < len(self.trc_coords_raw):
+                return self.trc_coords_raw[frame_idx_in_list]
+
+        return None
+
+    def calculate_kalman_3d_keypoints(self, frame_idx_in_list=None):
+        """Calculates or retrieves Kalman-smoothed 3D coordinates for a given frame."""
+        if frame_idx_in_list is None:
+            frame_idx_in_list = self.current_frame_idx
+
+        if getattr(self, "trc_coords_kalman", None) is None:
+            kalman_trc_path = os.path.join("output", self.seq_name, "pose-3d", "triangulated_kalman.trc")
+            if not os.path.exists(kalman_trc_path) and self.sequence_dir:
+                kalman_trc_path = os.path.join(self.sequence_dir, "pose-3d", "triangulated_kalman.trc")
+            if os.path.exists(kalman_trc_path):
+                try:
+                    from read_trc_files import extract_coordinates
+                    coords, _, _, _ = extract_coordinates(kalman_trc_path, to_mm=False, return_time=True)
+                    self.trc_coords_kalman = coords
+                except Exception:
+                    pass
+        
+        if getattr(self, "trc_coords_kalman", None) is not None:
+            if 0 <= frame_idx_in_list < len(self.trc_coords_kalman):
+                return self.trc_coords_kalman[frame_idx_in_list]
+
+        if hasattr(self, "trc_coords_raw") and self.trc_coords_raw is not None:
+            if not hasattr(self, "_cached_dynamic_kalman_coords") or self._cached_dynamic_kalman_coords is None:
+                try:
+                    from kalman_filter import apply_kalman_filter
+                    q = getattr(self, "kalman_q", 0.01)
+                    r = getattr(self, "kalman_r", 0.1)
+                    self._cached_dynamic_kalman_coords = apply_kalman_filter(
+                        self.trc_coords_raw, process_noise=q, measurement_noise=r, dt=1.0, use_rts_smoothing=True
+                    )
+                except Exception:
+                    self._cached_dynamic_kalman_coords = self.trc_coords_raw
+
+            if self._cached_dynamic_kalman_coords is not None and 0 <= frame_idx_in_list < len(self._cached_dynamic_kalman_coords):
+                return self._cached_dynamic_kalman_coords[frame_idx_in_list]
+
+        return self.calculate_raw_3d_keypoints(frame_idx_in_list)
+
+    def get_all_3d_coordinates(self):
+        """Returns 3D trajectory array of shape (n_frames, 17, 3) for all frames in sequence."""
+        if not self.sorted_frames:
+            return None
+        n_frames = len(self.sorted_frames)
+        
+        if getattr(self, "trc_coords", None) is not None:
+            return self.trc_coords[:n_frames]
+            
+        coords_list = []
+        for f in range(n_frames):
+            pts = self.calculate_3d_keypoints(f)
+            if pts is None:
+                pts = np.full((17, 3), np.nan)
+            coords_list.append(pts)
+            
+        coords_3d = np.array(coords_list)
+        if np.all(np.isnan(coords_3d)):
+            return None
+
+        if getattr(self, "kalman_enabled", True):
+            try:
+                from kalman_filter import apply_kalman_filter
+                q = getattr(self, "kalman_q", 0.01)
+                r = getattr(self, "kalman_r", 0.1)
+                coords_3d = apply_kalman_filter(coords_3d, process_noise=q, measurement_noise=r)
+            except Exception:
+                pass
+
+        return coords_3d
+
+    def load_gt_file(self, gt_path):
+        """Loads Ground Truth file (.trc, .json, or .pkl)."""
+        if not gt_path or not os.path.exists(gt_path):
+            print(f"[GT] Ground Truth file not found: {gt_path}")
+            return
+        
+        self.gt_path = gt_path
+        self.show_gt_overlay = True
+        print(f"[GT] Loading Ground Truth file: {gt_path}")
+        ext = os.path.splitext(gt_path)[1].lower()
+        try:
+            if ext == ".trc":
+                from read_trc_files import extract_coordinates
+                coords, frame_numbers, _, _ = extract_coordinates(gt_path, to_mm=False, return_time=True)
+                self.gt_3d_coords = coords
+                self.gt_3d_frame_numbers = frame_numbers
+                print(f"[GT] Successfully loaded 3D TRC GT coordinates: shape {coords.shape}")
+                
+            elif ext == ".json":
+                with open(gt_path, "r") as f:
+                    gt_json = json.load(f)
+                img_id_to_file = {img["id"]: img["file_name"] for img in gt_json.get("images", [])}
+                self.gt_2d_map = {}
+                for ann in gt_json.get("annotations", []):
+                    img_file = img_id_to_file.get(ann["image_id"])
+                    if img_file and "keypoints" in ann:
+                        kpts = np.array(ann["keypoints"]).reshape(-1, 3)
+                        base = os.path.basename(img_file)
+                        self.gt_2d_map[img_file] = kpts
+                        self.gt_2d_map[base] = kpts
+                        
+                        norm_path = img_file.replace('\\', '/')
+                        self.gt_2d_map[norm_path] = kpts
+                        parts = norm_path.replace('-', '/').split('/')
+                        cams = [p for p in parts if 'Camera' in p]
+                        frames = [p for p in parts if 'frame_' in p]
+                        if cams and frames:
+                            c_name = cams[0]
+                            f_name = frames[0]
+                            self.gt_2d_map[f"{c_name}/{f_name}"] = kpts
+                            self.gt_2d_map[f"{c_name}-{f_name}"] = kpts
+                print(f"[GT] Successfully loaded 2D COCO JSON GT: {len(self.gt_2d_map)} mapped entries")
+                
+            elif ext == ".pkl":
+                import pickle
+                with open(gt_path, "rb") as f:
+                    gt_preds = pickle.load(f)
+                self.gt_2d_map = {}
+                for p in gt_preds:
+                    img_path = p.get("img_path", "")
+                    instances = p.get("gt_instances", p.get("pred_instances", {}))
+                    if "keypoints" in instances:
+                        kpts = np.array(instances["keypoints"])
+                        if kpts.ndim == 3:
+                            kpts = kpts[0]
+                        base = os.path.basename(img_path)
+                        self.gt_2d_map[img_path] = kpts
+                        self.gt_2d_map[base] = kpts
+                        norm_path = img_path.replace('\\', '/')
+                        self.gt_2d_map[norm_path] = kpts
+                        parts = norm_path.replace('-', '/').split('/')
+                        cams = [p for p in parts if 'Camera' in p]
+                        frames = [p for p in parts if 'frame_' in p]
+                        if cams and frames:
+                            c_name = cams[0]
+                            f_name = frames[0]
+                            self.gt_2d_map[f"{c_name}/{f_name}"] = kpts
+                            self.gt_2d_map[f"{c_name}-{f_name}"] = kpts
+                print(f"[GT] Successfully loaded PKL GT: {len(self.gt_2d_map)} mapped entries")
+        except Exception as e:
+            print(f"[GT] Error loading GT file {gt_path}: {e}")
+
+        if self.sorted_frames and self.current_frame_idx >= 0:
+            self.show_current_frame(preserve_view=True)
+            self.update_3d_view()
+
+    def calculate_gt_3d_keypoints(self, frame_idx_in_list=None):
+        """Calculates or returns 3D Ground Truth keypoints for specified frame index."""
+        if frame_idx_in_list is None:
+            frame_idx_in_list = self.current_frame_idx
+        if frame_idx_in_list < 0 or not self.sorted_frames or frame_idx_in_list >= len(self.sorted_frames):
+            return None
+        
+        # 1. Return 3D TRC GT coordinates if loaded
+        if getattr(self, "gt_3d_coords", None) is not None:
+            if 0 <= frame_idx_in_list < len(self.gt_3d_coords):
+                return self.gt_3d_coords[frame_idx_in_list]
+            return None
+
+        # 2. Triangulate 2D GT keypoints if 2D GT map is loaded
+        if getattr(self, "gt_2d_map", None) is not None:
+            frame_idx = self.sorted_frames[frame_idx_in_list]
+            keypoints_data = {}
+            for cam_id, key in enumerate(CAMERA_KEYS):
+                kps = [[0.0, 0.0, 0]] * 17
+                if key in self.frame_data[frame_idx]:
+                    img_path = self.frame_data[frame_idx][key]
+                    cam_folder = os.path.basename(os.path.dirname(img_path))
+                    frame_name = os.path.basename(img_path)
+                    gt_kpts = None
+                    for k in [f"{cam_folder}/{frame_name}", f"{cam_folder}-{frame_name}", img_path, frame_name]:
+                        if k in self.gt_2d_map:
+                            gt_kpts = self.gt_2d_map[k]
+                            break
+                    if gt_kpts is not None:
+                        kps = []
+                        for i in range(min(17, len(gt_kpts))):
+                            kp = gt_kpts[i]
+                            u, v = float(kp[0]), float(kp[1])
+                            vis = int(kp[2]) if len(kp) > 2 else 1
+                            kps.append([u, v, vis])
+                keypoints_data[cam_id] = kps
+
+            # DLT Triangulation
+            matrices_list = []
+            for key in CAMERA_KEYS:
+                if key in self.camera_matrices:
+                    matrices_list.append(np.array(self.camera_matrices[key], dtype=np.float64))
+                else:
+                    matrices_list.append(np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]], dtype=np.float64))
+
+            pts_3d = np.full((17, 3), np.nan)
+            for kp_idx in range(17):
+                annotated_cams = []
+                for cam_id in range(8):
+                    kp = keypoints_data[cam_id][kp_idx]
+                    if len(kp) >= 3 and kp[2] > 0 and (kp[0] != 0.0 or kp[1] != 0.0):
+                        annotated_cams.append(cam_id)
+
+                if len(annotated_cams) >= 2:
+                    A = []
+                    for cam_id in annotated_cams:
+                        u, v = keypoints_data[cam_id][kp_idx][:2]
+                        P = matrices_list[cam_id]
+                        A.append(u * P[2] - P[0])
+                        A.append(v * P[2] - P[1])
+                    A = np.array(A)
+                    _, _, Vh = np.linalg.svd(A)
+                    X = Vh[-1]
+                    X = X / X[3]
+                    
+                    # Convert to TRC coordinate system for consistency with 3D visualizer
+                    # Z_trc = X_world, X_trc = Y_world, Y_trc = Z_world
+                    raw_pt = X[:3]
+                    pts_3d[kp_idx] = np.array([raw_pt[1], raw_pt[2], raw_pt[0]])
+
+            return pts_3d
+
+        return None
+
+        frame_idx = self.sorted_frames[frame_idx_in_list]
+
+        # Collect keypoints from all cameras
+        keypoints_data = {}
+        for cam_id, key in enumerate(CAMERA_KEYS):
+            if key in self.frame_data[frame_idx]:
+                img_path = self.frame_data[frame_idx][key]
+                img_id = self.img_file_map[img_path]["id"]
+                flat_kps = self.img_ann_map[img_id]["keypoints"]
+                kps = []
+                for i in range(17):
+                    kps.append(
+                        [flat_kps[i * 3], flat_kps[i * 3 + 1], flat_kps[i * 3 + 2]]
+                    )
+                keypoints_data[cam_id] = kps
+            else:
+                keypoints_data[cam_id] = [[0.0, 0.0, 0]] * 17
+
+        # Get projection matrices
+        matrices_list = []
+        for key in CAMERA_KEYS:
+            if key in self.camera_matrices:
+                matrices_list.append(self.camera_matrices[key])
+            else:
+                matrices_list.append([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]])
+
+        pts_3d = np.full((17, 3), np.nan)
+
+        for kp_idx in range(17):
+            annotated_cams = []
+            for cam_id in range(8):
+                kp = keypoints_data[cam_id][kp_idx]
+                if kp[2] > 0:
+                    annotated_cams.append(cam_id)
+
+            if len(annotated_cams) < 2:
+                continue
+
+            A = []
+            for cam_id in annotated_cams:
+                P = np.array(matrices_list[cam_id])
+                u, v, _ = keypoints_data[cam_id][kp_idx]
+
+                # Undistort coordinates before DLT linear triangulation if calibration is available
+                key = CAMERA_KEYS[cam_id]
+                model_key = key.split("_")[1] if "_" in key else key
+                if self.calib_data and model_key in self.calib_data:
+                    K = np.array(self.calib_data[model_key]["matrix"], dtype=np.float32)
+                    distortions = np.array(
+                        self.calib_data[model_key]["distortions"], dtype=np.float32
+                    )
+                    pt = np.array([[[u, v]]], dtype=np.float32)
+                    undistorted_pt = cv2.undistortPoints(
+                        pt, K, distortions, R=None, P=K
+                    )
+                    u, v = undistorted_pt[0, 0]
+
+                A.append(u * P[2, :] - P[0, :])
+                A.append(v * P[2, :] - P[1, :])
+
+            A = np.array(A)
+            _, _, Vt = np.linalg.svd(A)
+            X = Vt[-1, :]
+            if abs(X[3]) > 1e-5:
+                X = X / X[3]
+                X_3d = X[:3]
+                if np.all(np.abs(X_3d) < 50.0):
+                    pts_3d[kp_idx] = X_3d
+
+        return pts_3d
+
+    def calculate_global_3d_bounds(self):
+        """Calculates the global min and max coordinate bounds across all frames of the sequence."""
+        if not self.sorted_frames:
+            return None
+
+        all_xs = []
+        all_ys = []
+        all_zs = []
+
+        for idx in range(len(self.sorted_frames)):
+            pts_3d = self.calculate_3d_keypoints(idx)
+            if pts_3d is not None:
+                valid_mask = ~np.isnan(pts_3d)
+                valid_pts = pts_3d[
+                    valid_mask[:, 0] & valid_mask[:, 1] & valid_mask[:, 2]
+                ]
+                if len(valid_pts) > 0:
+                    all_xs.extend(valid_pts[:, 0])
+                    all_ys.extend(valid_pts[:, 1])
+                    all_zs.extend(valid_pts[:, 2])
+
+        if not all_xs:
+            return None
+
+        return {
+            "x_min": float(np.min(all_xs)),
+            "x_max": float(np.max(all_xs)),
+            "y_min": float(np.min(all_ys)),
+            "y_max": float(np.max(all_ys)),
+            "z_min": float(np.min(all_zs)),
+            "z_max": float(np.max(all_zs)),
+        }
+
+    def save_local_settings(self):
+        """Saves current settings and active frame to configs/local_settings.json."""
+        try:
+            settings = {
+                "keypoint_radius": self.keypoint_radius,
+                "auto_rotate_enabled": self.auto_rotate_enabled,
+                "show_3d_reprojection": self.show_3d_reprojection,
+                "show_kalman_overlay": getattr(self, "show_kalman_overlay", False),
+                "realtime_triangulation_enabled": self.realtime_triangulation_enabled,
+                "delete_bbox_on_clear": self.delete_bbox_on_clear,
+                "vitpose_show_confidence": self.vitpose_show_confidence,
+                "vitpose_threshold": self.vitpose_threshold,
+                "camera_dirs": getattr(self, "camera_dirs", None),
+                "current_frame_idx": self.current_frame_idx,
+                "yolo_path": getattr(self, "yolo_path", None),
+                "vitpose_path": getattr(self, "vitpose_path", None),
+                "frame_step": getattr(self, "frame_step", 1),
+                "start_frame_idx": getattr(self, "start_frame_idx", 0),
+                "navigation_mode": getattr(self, "navigation_mode", "all"),
+                "interpolated_opacity": getattr(self, "interpolated_opacity", 0.4),
+                "keypoint_size_3d": self.keypoint_size_3d,
+                "visualizer_fps": getattr(self, "visualizer_fps", 30),
+                "kalman_enabled": getattr(self, "kalman_enabled", True),
+                "kalman_q": getattr(self, "kalman_q", 0.01),
+                "kalman_r": getattr(self, "kalman_r", 0.1),
+                "use_kalman_trc": getattr(self, "use_kalman_trc", False),
+            }
+            os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+            with open(SETTINGS_FILE, "w") as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+
+    def run_and_save_kalman_trc(self, q, r):
+        """Runs Kalman RTS filter on raw 3D TRC coords and exports triangulated_kalman.trc to output/."""
+        if not hasattr(self, "trc_coords_raw") or self.trc_coords_raw is None:
+            self.load_trc_file()
+        if self.trc_coords_raw is None:
+            print("[Kalman] No raw 3D TRC coordinates available to filter.")
+            return False
+
+        try:
+            from kalman_filter import apply_kalman_filter
+            from read_trc_files import save_trc_file
+
+            smoothed_coords = apply_kalman_filter(
+                self.trc_coords_raw,
+                process_noise=q,
+                measurement_noise=r,
+                dt=1.0,
+                use_rts_smoothing=True
+            )
+
+            # Determine export path strictly in output/{seq_name}/pose-3d/triangulated_kalman.trc
+            out_kalman_path = os.path.join("output", self.seq_name, "pose-3d", "triangulated_kalman.trc")
+            save_trc_file(out_kalman_path, smoothed_coords, fps=30.0)
+
+            self.trc_coords_kalman = smoothed_coords
+            self._cached_dynamic_kalman_coords = None
+            self.kalman_q = q
+            self.kalman_r = r
+            self.kalman_enabled = True
+            self.use_kalman_trc = True
+
+            print(f"[Kalman] Exported smoothed TRC file to {out_kalman_path}")
+            self.load_trc_file()
+            self.save_local_settings()
+
+            if hasattr(self, "visualizer_3d_window") and self.visualizer_3d_window and self.visualizer_3d_window.isVisible():
+                self.visualizer_3d_window.sync_to_annotator_frame()
+
+            return True
+        except Exception as e:
+            print(f"[Kalman] Error generating kalman TRC file: {e}")
+            return False
+
+    def on_kalman_mode_changed(self, use_kalman):
+        """Callback when user toggles between Raw TRC and Kalman TRC."""
+        self.use_kalman_trc = use_kalman
+        self.load_trc_file()
+        self.save_local_settings()
+        if hasattr(self, "visualizer_3d_window") and self.visualizer_3d_window and self.visualizer_3d_window.isVisible():
+            self.visualizer_3d_window.sync_to_annotator_frame()
+
+    def on_visualizer_fps_changed(self, fps):
+        """Updates 3D visualizer playback framerate dynamically."""
+        self.visualizer_fps = fps
+        if hasattr(self, "visualizer_3d_window") and self.visualizer_3d_window:
+            self.visualizer_3d_window.update_fps(fps)
+        self.save_local_settings()
+
+    def load_local_settings(self):
+        """Loads settings from configs/local_settings.json if it exists."""
+        if not os.path.exists(SETTINGS_FILE):
+            return None
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+            return None
+
+    def clear_current_frame_annotations(self):
+        """Clears annotations (keypoints and optionally bboxes) for the current frame across all cameras."""
+        if self.current_frame_idx < 0 or not self.sorted_frames:
+            return
+
+        # Push to undo stack
+        self.push_undo()
+
+        frame_idx = self.sorted_frames[self.current_frame_idx]
+        log_debug(f"clear_current_frame_annotations started for frame_idx={frame_idx}")
+
+        cleared_count = 0
+        for cam_key in CAMERA_KEYS:
+            if cam_key in self.frame_data[frame_idx]:
+                img_path = self.frame_data[frame_idx][cam_key]
+                img_entry = self.img_file_map.get(img_path)
+                if img_entry:
+                    ann = self.img_ann_map.get(img_entry["id"])
+                    if ann:
+                        # Clear keypoints
+                        ann["keypoints"] = [0] * 51
+                        ann["num_keypoints"] = 0
+
+                        # Clear bbox if setting is active
+                        if getattr(self, "delete_bbox_on_clear", False):
+                            ann["bbox"] = [0, 0, 0, 0]
+                        cleared_count += 1
+
+        if cleared_count > 0:
+            self.save_annotations()
+            self.update_3d_view()
+            self.show_current_frame(preserve_view=True)
+            self.status_bar.showMessage(
+                f"Cleared annotations on {cleared_count} camera views for the current frame.",
+                3000,
+            )
+            log_debug(
+                f"clear_current_frame_annotations finished: cleared {cleared_count} views"
+            )
+
+    def closeEvent(self, event):
+        """Called when the window is closed. Save settings and state."""
+        self.save_local_settings()
+        event.accept()
