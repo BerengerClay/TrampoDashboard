@@ -107,22 +107,26 @@ class TrampolineAnnotator(QMainWindow):
         # Deep learning models
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Resolve paths from local settings or use default paths
+        # Resolve paths from local settings or use default candidate paths
         src_dir = os.path.dirname(os.path.abspath(__file__))
         root_dir = os.path.dirname(src_dir)
         
-        default_yolo_path = os.path.join(root_dir, "weights", "YOLO26s_best.pt")
-        default_vitpose_path = os.path.join(root_dir, "weights", "best_ViTPose-s_AP731.pth")
-        
-        def resolve_path(p, default):
-            if not p:
-                return default
-            if os.path.isabs(p):
-                return p
-            return os.path.abspath(os.path.join(root_dir, p))
+        saved_yolo = saved_settings.get("yolo_path")
+        saved_vitpose = saved_settings.get("vitpose_path")
 
-        self.yolo_path = resolve_path(saved_settings.get("yolo_path"), default_yolo_path)
-        self.vitpose_path = resolve_path(saved_settings.get("vitpose_path"), default_vitpose_path)
+        def resolve_existing_path(p, candidate_defaults):
+            if p:
+                abs_p = p if os.path.isabs(p) else os.path.abspath(os.path.join(root_dir, p))
+                if os.path.exists(abs_p):
+                    return abs_p
+            for default_name in candidate_defaults:
+                cand = os.path.abspath(os.path.join(root_dir, "weights", default_name))
+                if os.path.exists(cand):
+                    return cand
+            return p or os.path.abspath(os.path.join(root_dir, "weights", candidate_defaults[0]))
+
+        self.yolo_path = resolve_existing_path(saved_yolo, ["YOLO26s_best.pt", "yolov8s.pt"])
+        self.vitpose_path = resolve_existing_path(saved_vitpose, ["best_ViTPose-s_AP731.pth", "best_mvssl_AP713_iter290.pth", "best_coco_AP_epoch_298_AP0705.pth"])
 
         self.model_wrapper = ModelWrapper(
             weights_dir=None,
@@ -745,11 +749,9 @@ class TrampolineAnnotator(QMainWindow):
 
     def prompt_select_sequence(self):
         """Open a single file dialog to select multiple camera directories."""
-        initial_dir = "/usagers4/p123652/Documents/annotator/Data"
+        initial_dir = os.path.abspath("Data")
         if not os.path.exists(initial_dir):
-            initial_dir = "/usagers4/p123652/Documents/annotator"
-        if not os.path.exists(initial_dir):
-            initial_dir = os.path.expanduser("~")
+            initial_dir = os.path.abspath(".")
 
         selected_paths = select_multiple_directories(
             self, "Select 8 Camera Folders", initial_dir
@@ -1732,7 +1734,7 @@ class TrampolineAnnotator(QMainWindow):
         self.preprocess_process = QProcess(self)
         self.preprocess_process.setWorkingDirectory(".")
 
-        python_bin = "/usagers4/p123652/miniconda3/envs/mmpose_env/bin/python"
+        python_bin = sys.executable
         cams_args = list(self.camera_dirs.values())
 
         script_path = "src/utils/generate_predictions.py"

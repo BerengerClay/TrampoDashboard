@@ -33,16 +33,26 @@ class ModelWrapper:
             if self.yolo_model is not None:
                 return
             
-            if self.yolo_path:
-                pt_path = self.yolo_path
-            else:
-                pt_path = os.path.join(self.weights_dir, "YOLO26s_best.pt")
-                if not os.path.exists(pt_path):
-                    pt_path = os.path.join(self.weights_dir, "yolov8s.pt")
+            pt_path = self.yolo_path if (self.yolo_path and os.path.exists(self.yolo_path)) else None
+            if not pt_path:
+                candidates = [
+                    os.path.join(self.weights_dir, "YOLO26s_best.pt"),
+                    os.path.join(self.weights_dir, "yolov8s.pt")
+                ]
+                for cand in candidates:
+                    if os.path.exists(cand):
+                        pt_path = cand
+                        break
+                
+            if not pt_path or not os.path.exists(pt_path):
+                raise FileNotFoundError(
+                    f"YOLO weights file not found at '{self.yolo_path or pt_path}'. "
+                    "Please specify 'yolo_path' in configs/local_settings.json, set YOLO_WEIGHTS_PATH in .env, or place weights in 'weights/'."
+                )
                 
             print(f"Loading YOLO PyTorch model from {pt_path}...")
             try:
-                self.yolo_model = YOLO(pt_path if os.path.exists(pt_path) else "yolov8s.pt")
+                self.yolo_model = YOLO(pt_path)
                 print(f"YOLO PyTorch model ({os.path.basename(pt_path)}) loaded successfully.")
             except Exception as ex:
                 print(f"Could not load YOLO model: {ex}")
@@ -56,13 +66,23 @@ class ModelWrapper:
             if self.vitpose_model is not None:
                 return
             
-            if self.vitpose_path:
-                pth_path = self.vitpose_path
-            else:
-                pth_path = os.path.join(self.weights_dir, "best_ViTPose-s_AP731.pth")
+            pth_path = self.vitpose_path if (self.vitpose_path and os.path.exists(self.vitpose_path)) else None
+            if not pth_path:
+                candidates = [
+                    os.path.join(self.weights_dir, "best_ViTPose-s_AP731.pth"),
+                    os.path.join(self.weights_dir, "best_mvssl_AP713_iter290.pth"),
+                    os.path.join(self.weights_dir, "best_coco_AP_epoch_298_AP0705.pth")
+                ]
+                for cand in candidates:
+                    if os.path.exists(cand):
+                        pth_path = cand
+                        break
                 
-            if not os.path.exists(pth_path):
-                raise FileNotFoundError(f"ViTPose weights not found at: {pth_path}")
+            if not pth_path or not os.path.exists(pth_path):
+                raise FileNotFoundError(
+                    f"ViTPose weights file not found at '{self.vitpose_path or pth_path}'. "
+                    "Please specify 'vitpose_path' in configs/local_settings.json, set VITPOSE_WEIGHTS_PATH in .env, or place weights in 'weights/'."
+                )
                 
             try:
                 print(f"Loading ViTPose PyTorch model from {pth_path}...")

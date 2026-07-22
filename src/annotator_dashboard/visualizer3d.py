@@ -378,13 +378,25 @@ class AcrobaticsChartWidget(QWidget):
                         total_f = max(1, e - s)
                         tuck_cnt = sum(1 for item in self.acro_results[s:e] if item.get("position") == "Tuck")
                         pike_cnt = sum(1 for item in self.acro_results[s:e] if item.get("position") == "Pike")
-                        
                         if tuck_cnt / total_f >= 0.20:
                             posture = "Tuck"
                         elif pike_cnt / total_f >= 0.20:
                             posture = "Pike"
 
-                    fig_code = format_fig_trampoline_code(disp_s, disp_v, posture)
+                    # For multiple saltos (Double, Triple, etc.), measure twist accumulated at completion of each salto
+                    vrilles_per_salto = []
+                    n_s = max(1, int(round(target_s)))
+                    if n_s >= 2 and e > s:
+                        jump_s = saltos_plot[s:e]
+                        jump_v = vrilles_plot[s:e]
+                        for salto_idx in range(1, n_s):
+                            indices = np.where(jump_s >= float(salto_idx))[0]
+                            if len(indices) > 0:
+                                vrilles_per_salto.append(jump_v[indices[0]])
+                            else:
+                                vrilles_per_salto.append(0.0)
+
+                    fig_code = format_fig_trampoline_code(disp_s, disp_v, posture, vrilles_per_salto=vrilles_per_salto)
 
                     if max_s > 0.3 or max_v > 0.3:
                         jump_badges.append((mid_f, disp_s, disp_v, fig_code, k + 1))

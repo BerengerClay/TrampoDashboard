@@ -25,15 +25,63 @@ def load_env():
                     env_vars[k.strip()] = v.strip()
     return env_vars
 
+def load_local_settings():
+    settings_path = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "..", "configs", "local_settings.json"))
+    if not os.path.exists(settings_path):
+        settings_path = "configs/local_settings.json"
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
 def generate_predictions_and_triangulate(camera_paths, pkl_output, config_file, calib_file, trc_output, gt_file=None):
     env_vars = load_env()
-    yolo_path = env_vars.get("YOLO_WEIGHTS_PATH", "src/weights/YOLO26s_best.pt")
-    if not os.path.exists(yolo_path):
-        yolo_path = "/usagers4/p123652/Documents/annotator/weights/YOLO26s_best.pt"
+    local_settings = load_local_settings()
 
-    vitpose_weights_path = env_vars.get("VITPOSE_WEIGHTS_PATH", "weights/best_mvssl_AP713_iter290.pth")
-    if not os.path.exists(vitpose_weights_path):
-        vitpose_weights_path = "/usagers4/p123652/Documents/smoothing/weights/best_coco_AP_epoch_298_AP0705.pth"
+    # 1. Resolve YOLO weights path (.env -> local_settings.json -> weights/ candidates)
+    yolo_path = env_vars.get("YOLO_WEIGHTS_PATH")
+    if not yolo_path or not os.path.exists(yolo_path):
+        yolo_path = local_settings.get("yolo_path")
+    if not yolo_path or not os.path.exists(yolo_path):
+        candidates = [
+            "weights/YOLO26s_best.pt",
+            "src/weights/YOLO26s_best.pt",
+            "weights/yolov8s.pt"
+        ]
+        for cand in candidates:
+            if os.path.exists(cand):
+                yolo_path = cand
+                break
+
+    if not yolo_path or not os.path.exists(yolo_path):
+        raise FileNotFoundError(
+            "YOLO weights file not found. "
+            "Please specify 'yolo_path' in configs/local_settings.json, set YOLO_WEIGHTS_PATH in .env, or place weights in 'weights/'."
+        )
+
+    # 2. Resolve ViTPose weights path (.env -> local_settings.json -> weights/ candidates)
+    vitpose_weights_path = env_vars.get("VITPOSE_WEIGHTS_PATH")
+    if not vitpose_weights_path or not os.path.exists(vitpose_weights_path):
+        vitpose_weights_path = local_settings.get("vitpose_path")
+    if not vitpose_weights_path or not os.path.exists(vitpose_weights_path):
+        candidates = [
+            "weights/best_ViTPose-s_AP731.pth",
+            "weights/best_mvssl_AP713_iter290.pth",
+            "weights/best_coco_AP_epoch_298_AP0705.pth"
+        ]
+        for cand in candidates:
+            if os.path.exists(cand):
+                vitpose_weights_path = cand
+                break
+
+    if not vitpose_weights_path or not os.path.exists(vitpose_weights_path):
+        raise FileNotFoundError(
+            "ViTPose weights file not found. "
+            "Please specify 'vitpose_path' in configs/local_settings.json, set VITPOSE_WEIGHTS_PATH in .env, or place weights in 'weights/'."
+        )
 
     # 1. Resolve camera folders and files
     camera_folders = sorted(list(camera_paths))
@@ -256,7 +304,7 @@ def generate_predictions_and_triangulate(camera_paths, pkl_output, config_file, 
         
     # 4. Run MMPose test.py
     print("--- 3. Running ViTPose via MMPose test.py ---", flush=True)
-    python_bin = "/usagers4/p123652/miniconda3/envs/mmpose_env/bin/python"
+    python_bin = sys.executable
     
     cfg_candidate = os.path.join("configs", "td-hm_ViTPose-small_8xb64-210e_coco-256x192.py")
     if not os.path.exists(cfg_candidate):

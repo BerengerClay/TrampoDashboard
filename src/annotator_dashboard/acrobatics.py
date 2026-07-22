@@ -9,55 +9,47 @@ def normalize(v):
 
 def calculate_local_frame(Z_target, X_target_rough):
     """
-    Computes a strict orthonormal local coordinate frame [X, Y, Z].
-    Z_target: head-hip axis (upward/longitudinal)
-    X_target_rough: right-left hip axis
+    Computes a strict orthonormal local coordinate frame [X_body, Y_body, Z_body]:
+    - X_body (col 0): Lateral hip-to-hip axis (Salto / Somersault / Pitch)
+    - Y_body (col 1): Antero-Posterior axis (Front-Back / Roll)
+    - Z_body (col 2): Longitudinal pelvis-to-head axis (Vrille / Twist / Yaw)
     """
-    Z_t = normalize(Z_target)
-    X_t = np.cross(X_target_rough, Z_t)
-    X_t = normalize(X_t)
-    Y_t = np.cross(Z_t, X_t)
-    return X_t, Y_t, Z_t
+    Z_body = normalize(Z_target)
+    X_raw = normalize(X_target_rough)
+    Y_body = normalize(np.cross(Z_body, X_raw))
+    X_body = normalize(np.cross(Y_body, Z_body))
+    return X_body, Y_body, Z_body
 
 def calculate_acrobatics_rotations(X_t, Y_t, Z_t, num_frames):
     """
-    Calculates continuous cumulative somersaults (Salto) and twists (Vrille) without Gimbal Lock,
-    without curve drops during twists, and referenced to stable flip orientation.
-    - Vrille: incremental rotation of lateral hip axis Y around longitudinal body axis Z.
-    - Salto: incremental rotation magnitude of body axis Z signed by un-twisted lateral axis Y_ref.
+    Calculates cumulative somersaults and twists using strict body frame Euler angles (XYZ):
+    - angles[0]: rotation around X_t (Lateral axis -> Somersault / Salto)
+    - angles[2]: rotation around Z_t (Longitudinal axis -> Twist / Vrille)
     """
-    d_salto = np.zeros(num_frames)
-    d_vrille = np.zeros(num_frames)
+    saltos_history = []
+    vrilles_history = []
 
-    cum_vrille = 0.0
+    last_salto = 0.0
+    last_vrille = 0.0
 
-    for i in range(1, num_frames):
-        if np.isnan(Z_t[i-1]).any() or np.isnan(Z_t[i]).any() or np.isnan(Y_t[i-1]).any() or np.isnan(Y_t[i]).any():
-            continue
+    for i in range(num_frames):
+        frame_curr = np.column_stack((X_t[i], Y_t[i], Z_t[i]))
 
-        # 1. Vrille: rotation of Y around Z
-        cross_y = np.cross(Y_t[i-1], Y_t[i])
-        dot_y = np.clip(np.dot(Y_t[i-1], Y_t[i]), -1.0, 1.0)
-        d_vrille[i] = np.arctan2(np.dot(cross_y, Z_t[i]), dot_y)
-        cum_vrille += d_vrille[i]
+        if np.isnan(frame_curr).any():
+            saltos_history.append(last_salto)
+            vrilles_history.append(last_vrille)
+        else:
+            R_curr = R.from_matrix(frame_curr)
+            angles = R_curr.as_euler("XYZ")
 
-        # Un-rotate Y[i] by accumulated vrille angle around Z[i] to get stable anatomical flip axis
-        rot_z = R.from_rotvec(-cum_vrille * Z_t[i])
-        Y_ref = rot_z.apply(Y_t[i])
+            last_salto = angles[0]
+            last_vrille = angles[2]
 
-        # 2. Salto: magnitude of Z rotation signed by stable Y_ref (prevents drops during vrilles)
-        cross_z = np.cross(Z_t[i-1], Z_t[i])
-        dot_z = np.clip(np.dot(Z_t[i-1], Z_t[i]), -1.0, 1.0)
-        mag_z = np.linalg.norm(cross_z)
-        ang_z = np.arctan2(mag_z, dot_z)
+            saltos_history.append(last_salto)
+            vrilles_history.append(last_vrille)
 
-        proj_y = np.dot(cross_z, Y_ref)
-        sign_s = np.sign(proj_y) if abs(proj_y) > 1e-6 else 1.0
-
-        d_salto[i] = sign_s * ang_z
-
-    saltos_turns = np.cumsum(d_salto) / (2.0 * np.pi)
-    vrilles_turns = np.cumsum(d_vrille) / (2.0 * np.pi)
+    saltos_turns = np.unwrap(saltos_history) / (2 * np.pi)
+    vrilles_turns = np.unwrap(vrilles_history) / (2 * np.pi)
 
     return saltos_turns, vrilles_turns
 
@@ -212,16 +204,20 @@ def calculate_acrobatics_summary(coords_3d):
     if len(impacts) >= 2:
         for i in range(len(impacts) - 1):
             s, e = impacts[i], impacts[i + 1]
-            saltos_per_jump[s:e] = np.abs(s_turns[s:e] - s_turns[s])
-            vrilles_per_jump[s:e] = np.abs(v_turns[s:e] - v_turns[s])
-        saltos_per_jump[-1] = np.abs(s_turns[-1] - s_turns[impacts[-2]])
-        vrilles_per_jump[-1] = np.abs(v_turns[-1] - v_turns[impacts[-2]])
+            raw_s = np.abs(s_turns[s:e] - s_turns[s])
+            raw_v = np.abs(v_turns[s:e] - v_turns[s])
+            saltos_per_jump[s:e] = np.maximum.accumulate(raw_s)
+            vrilles_per_jump[s:e] = np.maximum.accumulate(raw_v)
+        
+        last_s = impacts[-2]
+        saltos_per_jump[-1] = max(saltos_per_jump[-2], np.abs(s_turns[-1] - s_turns[last_s]))
+        vrilles_per_jump[-1] = max(vrilles_per_jump[-2], np.abs(v_turns[-1] - v_turns[last_s]))
     else:
-        saltos_per_jump = np.abs(s_turns - s_turns[0])
-        vrilles_per_jump = np.abs(v_turns - v_turns[0])
+        saltos_per_jump = np.maximum.accumulate(np.abs(s_turns - s_turns[0]))
+        vrilles_per_jump = np.maximum.accumulate(np.abs(v_turns - v_turns[0]))
 
-    saltos_cumul = np.abs(s_turns - s_turns[0])
-    vrilles_cumul = np.abs(v_turns - v_turns[0])
+    saltos_cumul = np.maximum.accumulate(np.abs(s_turns - s_turns[0]))
+    vrilles_cumul = np.maximum.accumulate(np.abs(v_turns - v_turns[0]))
 
     acro_dict = {
         "shoulder": [5, 6],
@@ -234,54 +230,44 @@ def calculate_acrobatics_summary(coords_3d):
     return saltos_per_jump, vrilles_per_jump, saltos_cumul, vrilles_cumul, impacts, acro_results
 
 
-def format_fig_trampoline_code(salto_turns, vrille_turns, posture="Tuck"):
+def format_fig_trampoline_code(salto_turns, vrille_turns, posture="Tuck", vrilles_per_salto=None):
     """
-    Converts Somersault (Salto) turns, Twist (Vrille) turns, and posture into official FIG Trampoline Short Code.
-    Examples:
-    - 3.0 Saltos, 0.5 Vrilles, Tuck     -> FIG: 12001o (Triffis)
-    - 2.0 Saltos, 0.5 Vrilles, Tuck     -> FIG: 801o (Double Half Out)
-    - 1.5 Saltos, 1.0 Vrille, Pike       -> FIG: 611<
-    - 1.0 Salto, 0.5 Vrille, Straight   -> FIG: 41/ (Barani)
-    - 1.0 Salto, 1.0 Vrille, Straight   -> FIG: 42/ (Full)
+    Dynamically converts Somersault (Salto) turns, Twist (Vrille) turns, and posture into official FIG Trampoline Short Code.
+    Generates codes dynamically (e.g. 41o, 801o, 803o, 812o, 821o, 12001o) without hardcoded cases.
     """
     q_salto = int(round(salto_turns * 4))
-    h_vrille = int(round(vrille_turns * 2))
+    h_total = int(round(vrille_turns * 2))
 
     if q_salto == 0:
         return ""
 
     posture_code = "o" if "Tuck" in str(posture) else ("<" if "Pike" in str(posture) else "/")
 
-    # Single Salto (4 quarters)
+    # Single Salto (4 quarters = 1 salto)
     if q_salto <= 5:
-        if h_vrille == 0:
+        if h_total == 0:
             code = f"{q_salto}-"
         else:
-            code = f"{q_salto}{h_vrille}"
+            code = f"{q_salto}{h_total}"
         return f"{code}{posture_code}"
 
-    # Double Salto (8 quarters)
-    elif q_salto <= 9:
-        if h_vrille == 0:
-            code = "800"
-        elif h_vrille == 1:
-            code = "801"  # Half Out / Barani Out
-        elif h_vrille == 2:
-            code = "811"  # Half In Half Out
-        elif h_vrille == 3:
-            code = "821"  # Full In Half Out
-        else:
-            code = f"8{h_vrille}"
-        return f"{code}{posture_code}"
-
-    # Triple Salto (12 quarters)
+    # Multiple Saltos (Double = 8 quarters, Triple = 12 quarters, Quad = 16 quarters)
+    n_saltos = max(2, int(round(q_salto / 4)))
+    
+    if vrilles_per_salto is not None and len(vrilles_per_salto) >= (n_saltos - 1):
+        h_list = []
+        rem_h = h_total
+        for k in range(n_saltos - 1):
+            v_k = float(vrilles_per_salto[k])
+            hk = int(round(v_k * 2))
+            hk = max(0, min(rem_h, hk))
+            h_list.append(hk)
+            rem_h -= hk
+        h_list.append(max(0, rem_h))
+        vrille_digits = "".join(str(h) for h in h_list)
     else:
-        if h_vrille == 0:
-            code = "12000"
-        elif h_vrille == 1:
-            code = "12001"  # Triffis / Triple Half Out
-        elif h_vrille == 2:
-            code = "12011"
-        else:
-            code = f"12_{h_vrille}"
-        return f"{code}{posture_code}"
+        # Default fallback: attribute all twists to the last salto
+        h_list = [0] * (n_saltos - 1) + [h_total]
+        vrille_digits = "".join(str(h) for h in h_list)
+
+    return f"{q_salto}{vrille_digits}{posture_code}"
