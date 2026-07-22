@@ -270,7 +270,7 @@ def generate_predictions_and_triangulate(camera_paths, pkl_output, config_file, 
         f"test_dataloader.dataset.ann_file={abs_temp_json}",
         "test_dataloader.dataset.data_prefix.img=",
         f"test_evaluator.0.ann_file={abs_temp_json}",
-        "--dump", "../dashboard/temp_predictions.pkl"
+        "--dump", "temp_predictions.pkl"
     ]
     
     print(f"Command: {python_bin} " + " ".join(args), flush=True)
@@ -280,7 +280,7 @@ def generate_predictions_and_triangulate(camera_paths, pkl_output, config_file, 
     
     process = subprocess.Popen(
         [python_bin] + args,
-        cwd="../smoothing",
+        cwd=".",
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
