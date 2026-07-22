@@ -76,7 +76,7 @@ def generate_predictions_and_triangulate(camera_paths, pkl_output, config_file, 
             
     total_yolo_images = len(image_paths_to_run)
     print(f"Detecting bounding boxes for {total_yolo_images} images...", flush=True)
-    batch_size = 128
+    batch_size = 64
     total_yolo_batches = (total_yolo_images + batch_size - 1) // batch_size
     detected_bboxes = {}
     default_bbox = [300.0, 100.0, 1300.0, 950.0]
@@ -142,6 +142,13 @@ def generate_predictions_and_triangulate(camera_paths, pkl_output, config_file, 
                 if w > 0 and h > 0:
                     bbox = [x1, y1, w, h]
             detected_bboxes[path] = bbox
+
+    # Clean up YOLO model and release GPU memory before running ViTPose
+    del yolo_model
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
             
     # Load GT bboxes dynamically if gt_file parameter or nearby GT json is available
     gt_bbox_map = {}
@@ -257,12 +264,13 @@ def generate_predictions_and_triangulate(camera_paths, pkl_output, config_file, 
     abs_config_file = os.path.abspath(cfg_candidate)
     abs_weights = os.path.abspath(vitpose_weights_path)
     abs_temp_json = os.path.abspath(temp_json_path)
-    abs_data_root = os.path.abspath("Data")
+    abs_dump = os.path.abspath("temp_predictions.pkl")
+    mmpose_dir = os.path.abspath("mmpose_src")
     
     args = [
         "-u",
         "-s",
-        "mmpose_src/tools/test.py",
+        "tools/test.py",
         abs_config_file,
         abs_weights,
         "--cfg-options",
@@ -270,17 +278,20 @@ def generate_predictions_and_triangulate(camera_paths, pkl_output, config_file, 
         f"test_dataloader.dataset.ann_file={abs_temp_json}",
         "test_dataloader.dataset.data_prefix.img=",
         f"test_evaluator.0.ann_file={abs_temp_json}",
-        "--dump", "temp_predictions.pkl"
+        "test_dataloader.batch_size=32",
+        "test_dataloader.num_workers=2",
+        "--dump", abs_dump
     ]
     
     print(f"Command: {python_bin} " + " ".join(args), flush=True)
     
     env = os.environ.copy()
     env["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     
     process = subprocess.Popen(
         [python_bin] + args,
-        cwd=".",
+        cwd=mmpose_dir,
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

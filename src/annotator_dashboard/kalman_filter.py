@@ -10,14 +10,14 @@ Handles missing marker coordinates (NaN) by performing pure motion state predict
 """
 import numpy as np
 
-def apply_kalman_filter(coords_3d, process_noise=1e-2, measurement_noise=1e-1, dt=1.0, use_rts_smoothing=True):
+def apply_kalman_filter(coords_3d, process_noise=1e-4, measurement_noise=2e-3, dt=1.0, use_rts_smoothing=True):
     """
     Applies 6D Constant-Velocity Kalman Filtering & NaN Imputation to 3D keypoint trajectories.
 
     INPUTS:
     - coords_3d: np.ndarray of shape (n_frames, n_keypoints, 3)
-    - process_noise: float, process noise scale Q (default: 0.01)
-    - measurement_noise: float, measurement noise scale R (default: 0.1)
+    - process_noise: float, process noise scale Q (default: 0.0001)
+    - measurement_noise: float, measurement noise scale R (default: 0.002)
     - dt: float, frame time step (default: 1.0)
     - use_rts_smoothing: bool, whether to apply Rauch-Tung-Striebel backward pass
 
@@ -126,5 +126,5 @@ def apply_kalman_filter(coords_3d, process_noise=1e-2, measurement_noise=1e-1, d
     return filtered_coords
 
 # Backward compatibility alias
-def apply_kalman_smoothing_3d(coords_3d, process_noise_q=1e-2, measurement_noise_r=1e-1, fps=30.0):
+def apply_kalman_smoothing_3d(coords_3d, process_noise_q=1e-4, measurement_noise_r=2e-3, fps=30.0):
     return apply_kalman_filter(coords_3d, process_noise=process_noise_q, measurement_noise=measurement_noise_r, dt=1.0)

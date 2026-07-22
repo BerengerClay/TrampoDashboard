@@ -63,7 +63,7 @@ class Visualizer3DWidget(QWidget):
             self.ax.tick_params(colors='#94a3b8')
             
         self.view_mode = "athlete" if self.small_mode else "global"
-        self.keypoint_size = getattr(self.main_win, "keypoint_size_3d", 50) if self.main_win else 50
+        self.keypoint_size = getattr(self.main_win, "keypoint_size_3d", 14) if self.main_win else 14
         self.update_plot(None)
 
     def resizeEvent(self, event):
@@ -141,7 +141,10 @@ class Visualizer3DWidget(QWidget):
                 colors.append([qcol.red()/255.0, qcol.green()/255.0, qcol.blue()/255.0])
                 
         if xs:
-            kp_size = getattr(self, 'keypoint_size', 50)
+            if self.main_win and hasattr(self.main_win, 'keypoint_size_3d'):
+                kp_size = self.main_win.keypoint_size_3d
+            else:
+                kp_size = getattr(self, 'keypoint_size', 14)
             self.ax.scatter(xs, ys, zs, c=colors, s=kp_size if not self.small_mode else kp_size * 0.6, depthshade=True, zorder=10)
 
         # Draw 3D Ground Truth (GT) skeleton if enabled and available
@@ -177,7 +180,10 @@ class Visualizer3DWidget(QWidget):
 
                 # Draw GT scatter joints
                 if gt_xs:
-                    kp_size = getattr(self, 'keypoint_size', 50)
+                    if self.main_win and hasattr(self.main_win, 'keypoint_size_3d'):
+                        kp_size = self.main_win.keypoint_size_3d
+                    else:
+                        kp_size = getattr(self, 'keypoint_size', 14)
                     self.ax.scatter(
                         gt_xs, gt_ys, gt_zs,
                         c='#f59e0b', s=kp_size * 1.1 if not self.small_mode else kp_size * 0.7,

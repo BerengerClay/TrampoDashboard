@@ -1,4 +1,4 @@
-_base_ = ["mmpose_src/configs/_base_/default_runtime.py"]
+_base_ = ["../mmpose_src/configs/_base_/default_runtime.py"]
 
 # runtime
 train_cfg = dict(max_epochs=150, val_interval=1)

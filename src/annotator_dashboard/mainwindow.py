@@ -148,11 +148,11 @@ class TrampolineAnnotator(QMainWindow):
         self.frame_step = saved_settings.get("frame_step", 1)
         self.start_frame_idx = saved_settings.get("start_frame_idx", 0)
         self.interpolated_opacity = saved_settings.get("interpolated_opacity", 0.4)
-        self.keypoint_size_3d = saved_settings.get("keypoint_size_3d", 50)
+        self.keypoint_size_3d = saved_settings.get("keypoint_size_3d", 14)
         self.visualizer_fps = saved_settings.get("visualizer_fps", 30)
         self.kalman_enabled = saved_settings.get("kalman_enabled", True)
-        self.kalman_q = saved_settings.get("kalman_q", 0.01)
-        self.kalman_r = saved_settings.get("kalman_r", 0.1)
+        self.kalman_q = saved_settings.get("kalman_q", 0.0001)
+        self.kalman_r = saved_settings.get("kalman_r", 0.002)
         self.use_kalman_trc = saved_settings.get("use_kalman_trc", False)
         self.trc_coords_raw = None
         # Determine initial navigation mode (map old boolean check if present)
@@ -2479,8 +2479,8 @@ class TrampolineAnnotator(QMainWindow):
                 "keypoint_size_3d": self.keypoint_size_3d,
                 "visualizer_fps": getattr(self, "visualizer_fps", 30),
                 "kalman_enabled": getattr(self, "kalman_enabled", True),
-                "kalman_q": getattr(self, "kalman_q", 0.01),
-                "kalman_r": getattr(self, "kalman_r", 0.1),
+                "kalman_q": getattr(self, "kalman_q", 0.0001),
+                "kalman_r": getattr(self, "kalman_r", 0.002),
                 "use_kalman_trc": getattr(self, "use_kalman_trc", False),
             }
             os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)

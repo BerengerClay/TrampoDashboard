@@ -56,7 +56,7 @@ class SettingsDialog(QDialog):
             self.original_show_confidence = getattr(
                 parent, "vitpose_show_confidence", True
             )
-            self.original_kp_size_3d = getattr(parent, "keypoint_size_3d", 50)
+            self.original_kp_size_3d = getattr(parent, "keypoint_size_3d", 10)
             self.original_show_gt = getattr(parent, "show_gt_overlay", False)
             self.original_kalman_enabled = getattr(parent, "kalman_enabled", True)
             self.original_kalman_q = getattr(parent, "kalman_q", 0.0001)
@@ -68,11 +68,11 @@ class SettingsDialog(QDialog):
             self.original_rotate = True
             self.original_reproject = False
             self.original_show_confidence = True
-            self.original_kp_size_3d = 50
+            self.original_kp_size_3d = 14
             self.original_show_gt = False
             self.original_kalman_enabled = True
-            self.original_kalman_q = 0.01
-            self.original_kalman_r = 0.1
+            self.original_kalman_q = 0.0001
+            self.original_kalman_r = 0.002
             self.original_use_kalman_trc = False
             self.original_kalman_overlay = False
 

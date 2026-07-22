@@ -25,6 +25,7 @@ Data/
 *.pkl
 *.pickle
 output/
+work_dirs/
 
 # Model Weights
 weights/
