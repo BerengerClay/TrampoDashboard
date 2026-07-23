@@ -7,9 +7,11 @@ Interactive 3D pose visualization, 2D reprojection, RTS Kalman smoothing, and FI
 ### 1. Requirements & Setup
 
 - Clone repository with submodules:
+
   ```bash
-  git clone --recursive https://github.com/BerengerClay/TrampoDashboard
+  git clone --recursive git@github.com:BerengerClay/TrampoDashboard.git
   ```
+
   _(Or if already cloned without submodules: `git submodule update --init --recursive`)_
 
 - Create and activate Conda environment (`dashboard_env`):
