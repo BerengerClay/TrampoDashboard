@@ -6,12 +6,18 @@ Interactive 3D pose visualization, 2D reprojection, RTS Kalman smoothing, and FI
 
 ### 1. Requirements & Setup
 
-- Conda environment with PyTorch and MMPose (`mmpose_env`).
 - Clone repository with submodules:
   ```bash
   git clone --recursive https://github.com/BerengerClay/TrampoDashboard
   ```
   _(Or if already cloned without submodules: `git submodule update --init --recursive`)_
+
+- Create and activate Conda environment (`dashboard_env`):
+  ```bash
+  conda env create -f dashboard_env.yml
+  conda activate dashboard_env
+  pip install -r requirements.txt
+  ```
 
 ### 2. Running the Dashboard
 
