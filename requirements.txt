@@ -74,7 +74,7 @@ narwhals
 nbformat
 nest-asyncio
 networkx
-numpy
+numpy<2.0.0,>=1.23.0
 nvidia-cublas-cu12
 nvidia-cuda-cupti-cu12
 nvidia-cuda-nvrtc-cu12
@@ -134,12 +134,13 @@ pytz
 PyYAML
 pyzmq
 referencing
-requests
+requests<2.30.0
 retrying
 rich
 rpds-py
 rtmlib
 scipy
+setuptools<70.0.0
 shapely
 six
 stack-data
@@ -168,3 +169,4 @@ widgetsnbextension
 xtcocotools
 yapf
 zipp
+
