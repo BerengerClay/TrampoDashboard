@@ -50,8 +50,9 @@ def extract_coordinates(filename, to_mm=True, return_time=False):
     marker_names, marker_indices = [], []
     for name in column_names[2:]:  # Ignorer 'Frame#' et 'Time'
         if name.startswith('X'):
-            marker_indices.append(name[1:].split('_')[0])
-            marker_names.append(name.split('_')[-1])
+            parts = name[1:].split('_', 1)
+            marker_indices.append(parts[0])
+            marker_names.append(parts[1] if len(parts) > 1 else "")
 
     # -- Convertir en numpy array (frames, keypoints, 3) --
     num_frames = df.shape[0]
