@@ -75,9 +75,10 @@ def extract_coordinates(filename, to_mm=True, return_time=False):
     return coords, frame_numbers, marker_names
 
 
-def save_trc_file(filename, coords, fps=30.0, marker_names=None):
+def save_trc_file(filename, coords, fps=30.0, marker_names=None, is_mm=False):
     """
     Saves a 3D coordinate array of shape (frames, keypoints, 3) back to a standard .trc file.
+    - is_mm: if True, converts input coordinates from millimeters to meters to match the header 'm' unit.
     """
     if marker_names is None:
         marker_names = [
@@ -88,6 +89,9 @@ def save_trc_file(filename, coords, fps=30.0, marker_names=None):
         ]
     num_frames, num_markers, _ = coords.shape
     dt = 1.0 / float(fps)
+
+    # Reconvert from mm to meters if coordinates are in mm
+    write_coords = coords / 1000.0 if is_mm else coords
     
     os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
     with open(filename, "w", encoding="utf-8") as f:
@@ -101,17 +105,18 @@ def save_trc_file(filename, coords, fps=30.0, marker_names=None):
         f.write("\t".join(header1) + "\n")
         
         header2 = ["", ""]
-        for i in range(1, num_markers + 1):
-            header2.extend([f"X{i}", f"Y{i}", f"Z{i}"])
+        for i, m in enumerate(marker_names, 1):
+            header2.extend([f"X{i}_{m}", f"Y{i}_{m}", f"Z{i}_{m}"])
         f.write("\t".join(header2) + "\n")
         
         for frame_idx in range(num_frames):
             time_val = frame_idx * dt
             row = [str(frame_idx), f"{time_val:.4f}"]
             for m_idx in range(num_markers):
-                pt = coords[frame_idx, m_idx]
+                pt = write_coords[frame_idx, m_idx]
                 if np.isnan(pt).any():
                     row.extend(["nan", "nan", "nan"])
                 else:
                     row.extend([f"{pt[0]:.6f}", f"{pt[1]:.6f}", f"{pt[2]:.6f}"])
             f.write("\t".join(row) + "\n")
+

@@ -85,7 +85,7 @@ def detect_trampoline_impacts(coords, ankle_idxs=(15, 16), knee_idxs=(13, 14)):
     for start, end in zip(contact_starts, contact_ends):
         if end > start:
             window = knees_height[start : end + 1]
-            if len(window) > 0:
+            if len(window) > 0 and not np.isnan(window).all():
                 raw_impacts.append(start + np.nanargmin(window))
 
     filtered_impacts = []
@@ -178,6 +178,11 @@ def detect_acrobatic_position(coords, idx_dict=None):
 
     return results, hip_angles, knee_angles
 
+def _safe_accumulate(arr):
+    """Safely accumulates maximum values over an array containing NaNs."""
+    cleaned = np.nan_to_num(arr, nan=0.0)
+    return np.maximum.accumulate(cleaned)
+
 def calculate_acrobatics_summary(coords_3d):
     """
     Computes per-jump Somersaults, Twists, impacts, and Postures matching src_old/visualize/dashboard.py.
@@ -196,8 +201,8 @@ def calculate_acrobatics_summary(coords_3d):
 
     impacts = detect_trampoline_impacts(coords_3d)
 
-    s_turns = np.array(saltos_turns)
-    v_turns = np.array(vrilles_turns)
+    s_turns = np.nan_to_num(np.array(saltos_turns), nan=0.0)
+    v_turns = np.nan_to_num(np.array(vrilles_turns), nan=0.0)
     saltos_per_jump = np.zeros_like(s_turns)
     vrilles_per_jump = np.zeros_like(v_turns)
 
@@ -206,18 +211,18 @@ def calculate_acrobatics_summary(coords_3d):
             s, e = impacts[i], impacts[i + 1]
             raw_s = np.abs(s_turns[s:e] - s_turns[s])
             raw_v = np.abs(v_turns[s:e] - v_turns[s])
-            saltos_per_jump[s:e] = np.maximum.accumulate(raw_s)
-            vrilles_per_jump[s:e] = np.maximum.accumulate(raw_v)
+            saltos_per_jump[s:e] = _safe_accumulate(raw_s)
+            vrilles_per_jump[s:e] = _safe_accumulate(raw_v)
         
         last_s = impacts[-2]
         saltos_per_jump[-1] = max(saltos_per_jump[-2], np.abs(s_turns[-1] - s_turns[last_s]))
         vrilles_per_jump[-1] = max(vrilles_per_jump[-2], np.abs(v_turns[-1] - v_turns[last_s]))
     else:
-        saltos_per_jump = np.maximum.accumulate(np.abs(s_turns - s_turns[0]))
-        vrilles_per_jump = np.maximum.accumulate(np.abs(v_turns - v_turns[0]))
+        saltos_per_jump = _safe_accumulate(np.abs(s_turns - s_turns[0]))
+        vrilles_per_jump = _safe_accumulate(np.abs(v_turns - v_turns[0]))
 
-    saltos_cumul = np.maximum.accumulate(np.abs(s_turns - s_turns[0]))
-    vrilles_cumul = np.maximum.accumulate(np.abs(v_turns - v_turns[0]))
+    saltos_cumul = _safe_accumulate(np.abs(s_turns - s_turns[0]))
+    vrilles_cumul = _safe_accumulate(np.abs(v_turns - v_turns[0]))
 
     acro_dict = {
         "shoulder": [5, 6],

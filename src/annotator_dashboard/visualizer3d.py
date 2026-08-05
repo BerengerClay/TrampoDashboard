@@ -80,6 +80,9 @@ class Visualizer3DWidget(QWidget):
         self.ax.xaxis.pane.fill = False
         self.ax.yaxis.pane.fill = False
         self.ax.zaxis.pane.fill = False
+        self.ax.xaxis.pane.set_edgecolor('#1e293b')
+        self.ax.yaxis.pane.set_edgecolor('#1e293b')
+        self.ax.zaxis.pane.set_edgecolor('#1e293b')
         self.ax.grid(True, color='#334155', linestyle='--')
         
         if self.small_mode:
@@ -93,7 +96,7 @@ class Visualizer3DWidget(QWidget):
         if pts_3d is None or np.all(np.isnan(pts_3d)):
             self.ax.text2D(0.5, 0.5, "Not enough points\n(triangulate to generate 3D)", 
                            color='#94a3b8', ha='center', va='center', transform=self.ax.transAxes)
-            self.canvas.draw()
+            self.canvas.draw_idle()
             return
             
         # Transform coords for axis mapping (inverse zup2yup rotation)
@@ -112,16 +115,12 @@ class Visualizer3DWidget(QWidget):
             
             if not np.isnan(pt1[0]) and not np.isnan(pt2[0]):
                 if conn in [(5, 6), (11, 12)]:
-                    # Torso/Trunk (Emerald Green)
                     col_str = '#10b981'
                 elif conn in [(0, 1), (0, 2), (1, 3), (2, 4)]:
-                    # Head/Face (Magenta/Pink)
                     col_str = '#ec4899'
                 elif p1 in [5, 7, 9, 11, 13, 15] and p2 in [5, 7, 9, 11, 13, 15]:
-                    # Left side (Cyan)
                     col_str = '#06b6d4'
                 else:
-                    # Right side (Orange/Red)
                     col_str = '#f97316'
                     
                 self.ax.plot([pt1[0], pt2[0]], [pt1[1], pt2[1]], [pt1[2], pt2[2]], 
@@ -141,15 +140,12 @@ class Visualizer3DWidget(QWidget):
                 colors.append([qcol.red()/255.0, qcol.green()/255.0, qcol.blue()/255.0])
                 
         if xs:
-            if self.main_win and hasattr(self.main_win, 'keypoint_size_3d'):
-                kp_size = self.main_win.keypoint_size_3d
-            else:
-                kp_size = getattr(self, 'keypoint_size', 14)
+            kp_size = self.main_win.keypoint_size_3d if (self.main_win and hasattr(self.main_win, 'keypoint_size_3d')) else getattr(self, 'keypoint_size', 14)
             self.ax.scatter(xs, ys, zs, c=colors, s=kp_size if not self.small_mode else kp_size * 0.6, depthshade=True, zorder=10)
 
         # Draw 3D Ground Truth (GT) skeleton if enabled and available
         if self.main_win and getattr(self.main_win, "show_gt_overlay", False):
-            if gt_pts_3d is None:
+            if gt_pts_3d is None and hasattr(self.main_win, "calculate_gt_3d_keypoints"):
                 gt_pts_3d = self.main_win.calculate_gt_3d_keypoints()
             if gt_pts_3d is not None and not np.all(np.isnan(gt_pts_3d)):
                 gt_pts_3d = gt_pts_3d.copy()
@@ -167,7 +163,6 @@ class Visualizer3DWidget(QWidget):
                         gt_ys.append(pt[1])
                         gt_zs.append(pt[2])
 
-                # Draw GT skeleton lines (Bright Gold / Amber, dashed)
                 for conn in COCO_SKELETON:
                     p1, p2 = conn
                     pt1 = gt_pts_3d[p1]
@@ -178,19 +173,15 @@ class Visualizer3DWidget(QWidget):
                             color='#fbbf24', linestyle='--', linewidth=2.5 if not self.small_mode else 1.8, zorder=8
                         )
 
-                # Draw GT scatter joints
                 if gt_xs:
-                    if self.main_win and hasattr(self.main_win, 'keypoint_size_3d'):
-                        kp_size = self.main_win.keypoint_size_3d
-                    else:
-                        kp_size = getattr(self, 'keypoint_size', 14)
+                    kp_size = self.main_win.keypoint_size_3d if (self.main_win and hasattr(self.main_win, 'keypoint_size_3d')) else getattr(self, 'keypoint_size', 14)
                     self.ax.scatter(
                         gt_xs, gt_ys, gt_zs,
                         c='#f59e0b', s=kp_size * 1.1 if not self.small_mode else kp_size * 0.7,
                         depthshade=False, zorder=12
                     )
                              
-        # Set equal aspect ratio for 3D plot
+        # Set 3D axes limits
         if self.view_mode == "global" and self.main_win and getattr(self.main_win, 'global_3d_bounds', None) is not None:
             raw_bounds = self.main_win.global_3d_bounds
             bounds = {
@@ -228,10 +219,8 @@ class Visualizer3DWidget(QWidget):
                 self.ax.set_xlim(mid_x - max_range * 0.5, mid_x + max_range * 0.5)
                 self.ax.set_ylim(mid_y - max_range * 0.5, mid_y + max_range * 0.5)
                 self.ax.set_zlim(mid_z - max_range * 0.5, mid_z + max_range * 0.5)
-            
-        log_debug("Visualizer3DWidget.update_plot calling canvas.draw_idle()")
+
         self.canvas.draw_idle()
-        log_debug("Visualizer3DWidget.update_plot canvas.draw_idle() done")
 
 
 class AcrobaticsChartWidget(QWidget):
@@ -552,11 +541,17 @@ class Visualizer3DWindow(QMainWindow):
         configure_button(self.btn_view_mode, text="Global Mode", icon_name="globe", icon_color="#ffffff")
         self.btn_view_mode.clicked.connect(self.toggle_view_mode)
         self.btn_view_mode.setToolTip("Toggle between Global View and Athlete Focus Mode")
+        
         self.btn_trc_mode = QPushButton()
         self.btn_trc_mode.setToolTip("Toggle between raw 3D trajectory (triangulated.trc) and smoothed (triangulated_kalman.trc)")
         self.btn_trc_mode.clicked.connect(self.toggle_trc_mode)
         self.update_trc_mode_button()
-        
+
+        self.btn_toggle_chart = QPushButton()
+        configure_button(self.btn_toggle_chart, text="Chart 2D", icon_name="bar-chart-2", icon_color="#ffffff")
+        self.btn_toggle_chart.setToolTip("Show/Hide 2D Acrobatics Rotations Chart to optimize animation FPS")
+        self.btn_toggle_chart.clicked.connect(self.toggle_chart_visibility)
+
         self.playback_slider = QSlider(Qt.Orientation.Horizontal)
         self.playback_slider.valueChanged.connect(self.on_slider_moved)
         self.playback_slider.setStyleSheet("""
@@ -586,6 +581,7 @@ class Visualizer3DWindow(QMainWindow):
         control_layout.addWidget(self.btn_speed)
         control_layout.addWidget(self.btn_trc_mode)
         control_layout.addWidget(self.btn_view_mode)
+        control_layout.addWidget(self.btn_toggle_chart)
         control_layout.addWidget(self.playback_slider)
         control_layout.addWidget(self.lbl_frame_info)
         
@@ -785,7 +781,15 @@ class Visualizer3DWindow(QMainWindow):
             configure_button(self.btn_view_mode, text="Focus Mode", icon_name="maximize", icon_color="#ffffff")
         self.update_visualization()
 
-
+    def toggle_chart_visibility(self):
+        """Shows or hides the 2D Acrobatics Rotations chart widget to optimize playback FPS."""
+        vis = not self.widget_acro_chart.isVisible()
+        self.widget_acro_chart.setVisible(vis)
+        if vis:
+            configure_button(self.btn_toggle_chart, text="Chart 2D", icon_name="bar-chart-2", icon_color="#ffffff")
+        else:
+            configure_button(self.btn_toggle_chart, text="Chart 2D (Off)", icon_name="bar-chart-2", icon_color="#94a3b8", bg_color="#334155")
+        self.update_visualization()
 
     def update_visualization(self):
         log_debug("Visualizer3DWindow.update_visualization started")
@@ -796,13 +800,16 @@ class Visualizer3DWindow(QMainWindow):
             self.widget_3d.update_plot(pts_3d, gt_pts_3d=gt_pts_3d)
             log_debug("Visualizer3DWindow.update_visualization update_plot done")
 
-            # Ensure full 3D trajectory data is loaded into AcrobaticsChartWidget
-            if self.widget_acro_chart.saltos_per_jump is None and hasattr(self.main_win, "get_all_3d_coordinates"):
-                all_coords_3d = self.main_win.get_all_3d_coordinates()
-                if all_coords_3d is not None:
-                    self.widget_acro_chart.set_data(all_coords_3d)
-                    
-            self.widget_acro_chart.update_frame_cursor(self.playback_frame_idx)
+            # Update 2D chart cursor only if chart is visible
+            if self.widget_acro_chart.isVisible():
+                if self.widget_acro_chart.saltos_per_jump is None and hasattr(self.main_win, "get_all_3d_coordinates"):
+                    all_coords_3d = self.main_win.get_all_3d_coordinates()
+                    if all_coords_3d is not None:
+                        self.widget_acro_chart.set_data(all_coords_3d)
+                        
+                # Throttle 2D cursor redraws during active video playback for maximum FPS
+                if not self.play_timer.isActive() or (self.playback_frame_idx % 2 == 0):
+                    self.widget_acro_chart.update_frame_cursor(self.playback_frame_idx)
 
     def closeEvent(self, event):
         self.play_timer.stop()

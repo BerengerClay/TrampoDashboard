@@ -129,6 +129,7 @@ PyQt5_sip
 PyQt6
 PyQt6-Qt6
 PyQt6_sip
+pytest
 python-dateutil
 pytz
 PyYAML

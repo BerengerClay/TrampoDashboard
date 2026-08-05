@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+testpaths = ["Tests"]
+norecursedirs = ["mmpose_src", "output", "weights", ".git"]
+python_files = ["test_*.py"]

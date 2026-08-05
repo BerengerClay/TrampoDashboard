@@ -53,7 +53,9 @@ class ModelWrapper:
             print(f"Loading YOLO PyTorch model from {pt_path}...")
             try:
                 self.yolo_model = YOLO(pt_path)
-                print(f"YOLO PyTorch model ({os.path.basename(pt_path)}) loaded successfully.")
+                if hasattr(self.yolo_model, "to"):
+                    self.yolo_model.to(self.device)
+                print(f"YOLO PyTorch model ({os.path.basename(pt_path)}) loaded successfully on device: {self.device}.")
             except Exception as ex:
                 print(f"Could not load YOLO model: {ex}")
                 raise ex
@@ -99,7 +101,14 @@ class ModelWrapper:
         # Run YOLO detector
         # conf=0.25, classes=[0] to focus on person (trampoline jumper)
         with self.lock:
-            results = self.yolo_model(image_path, verbose=False, conf=0.25)
+            results = self.yolo_model(
+                image_path,
+                verbose=False,
+                conf=0.25,
+                device=self.device,
+                classes=[0],
+                imgsz=640
+            )
         
         if len(results) > 0 and len(results[0].boxes) > 0:
             boxes = results[0].boxes
@@ -253,10 +262,22 @@ class ModelWrapper:
 
     def run_yolo_batch(self, image_paths):
         """Detects bounding boxes for a batch of image paths using YOLO."""
+        import time
         self.init_yolo()
         
+        t0 = time.time()
         with self.lock:
-            results = self.yolo_model(image_paths, verbose=False, conf=0.25)
+            results = self.yolo_model(
+                image_paths,
+                verbose=False,
+                conf=0.25,
+                device=self.device,
+                classes=[0],
+                imgsz=640
+            )
+        elapsed_s = time.time() - t0
+        n_imgs = max(1, len(image_paths))
+        print(f"[YOLO GPU] Batch {n_imgs} images completed in {elapsed_s:.3f} s ({(elapsed_s / n_imgs) * 1000:.1f} ms/img)", flush=True)
             
         bboxes = []
         for res in results:

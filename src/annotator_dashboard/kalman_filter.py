@@ -113,7 +113,11 @@ def apply_kalman_filter(coords_3d, process_noise=1e-4, measurement_noise=2e-3, d
                 if abs(det) < 1e-12:
                     x_smooth[t] = x_filt[t]
                     continue
-                C = P_filt[t] @ F.T @ np.linalg.inv(P_pred[t+1])
+                try:
+                    inv_P = np.linalg.inv(P_pred[t+1])
+                except np.linalg.LinAlgError:
+                    inv_P = np.linalg.pinv(P_pred[t+1])
+                C = P_filt[t] @ F.T @ inv_P
                 x_smooth[t] = x_filt[t] + C @ (x_smooth[t+1] - x_pred[t+1])
 
             filtered_coords[first_v:, k, :] = x_smooth[first_v:, :3]
@@ -127,4 +131,6 @@ def apply_kalman_filter(coords_3d, process_noise=1e-4, measurement_noise=2e-3, d
 
 # Backward compatibility alias
 def apply_kalman_smoothing_3d(coords_3d, process_noise_q=1e-4, measurement_noise_r=2e-3, fps=30.0):
-    return apply_kalman_filter(coords_3d, process_noise=process_noise_q, measurement_noise=measurement_noise_r, dt=1.0)
+    dt_val = 1.0 / float(fps) if fps and fps > 0 else 1.0
+    return apply_kalman_filter(coords_3d, process_noise=process_noise_q, measurement_noise=measurement_noise_r, dt=dt_val)
+

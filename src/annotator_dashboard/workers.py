@@ -47,6 +47,7 @@ class WorkerThread(QThread):
 class SequencePreprocessWorker(QThread):
     """Background computation thread to run YOLO and ViTPose on all images in the sequence using batching."""
     progress = pyqtSignal(int, int, str)
+    batch_results = pyqtSignal(list)
     finished = pyqtSignal(int)
     error = pyqtSignal(str)
 
@@ -109,23 +110,35 @@ class SequencePreprocessWorker(QThread):
                     keypoints_list = self.model_wrapper.run_vitpose_batch(paths, bboxes, threshold=self.threshold)
                 
                 # 3. Save predictions back to memory database
+                batch_updates = []
                 for idx, (cam_key, path, img_id, ann) in enumerate(images_to_process):
                     bbox = bboxes[idx]
                     
                     if bbox:
-                        ann["bbox"] = bbox
+                        flat_kps = None
+                        num_kps = 0
                         if keypoints_list and idx < len(keypoints_list):
                             keypoints = keypoints_list[idx]
                             if keypoints:
                                 flat_kps = []
                                 for kp in keypoints:
                                     flat_kps.extend(kp)
-                                ann["keypoints"] = flat_kps
-                                ann["num_keypoints"] = sum(1 for idx_kp in range(17) if flat_kps[idx_kp*3 + 2] > 0)
+                                num_kps = sum(1 for idx_kp in range(17) if flat_kps[idx_kp*3 + 2] > 0)
+                        
+                        ann["bbox"] = bbox
+                        if flat_kps is not None:
+                            ann["keypoints"] = flat_kps
+                            ann["num_keypoints"] = num_kps
+                        
+                        batch_updates.append((img_id, bbox, flat_kps, num_kps))
                         processed_images_count += 1
+                
+                if batch_updates:
+                    self.batch_results.emit(batch_updates)
                 
                 self.progress.emit(f_idx + 1, total_frames, f"Processing frame {f_idx + 1}/{total_frames}...")
             
             self.finished.emit(processed_images_count)
         except Exception as e:
             self.error.emit(str(e))
+

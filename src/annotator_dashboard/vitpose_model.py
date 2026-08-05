@@ -166,9 +166,12 @@ def load_vitpose_model(weight_path, device="cpu"):
     finder = MockFinder()
     sys.meta_path.insert(0, finder)
     try:
-        model = ViTPose(img_size=(256, 192), patch_size=16, in_chans=3, embed_dim=384, depth=12, num_heads=12, out_channels=17)
-        checkpoint = torch.load(weight_path, map_location=device, weights_only=False)
-        state_dict = checkpoint.get("state_dict", checkpoint)
+        try:
+            checkpoint = torch.load(weight_path, map_location=device, weights_only=True)
+        except Exception:
+            checkpoint = torch.load(weight_path, map_location=device, weights_only=False)
+        
+        state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         
         # Strip prefixes if checkpoint is saved inside mmpose config structure
         # Standard format has 'backbone.pos_embed' etc. which matches our class structure.

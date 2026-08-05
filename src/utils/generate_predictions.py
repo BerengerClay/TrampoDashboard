@@ -129,21 +129,31 @@ def generate_predictions_and_triangulate(camera_paths, pkl_output, config_file, 
     detected_bboxes = {}
     default_bbox = [300.0, 100.0, 1300.0, 950.0]
     
-    def load_single_image(path):
-        try:
-            img = cv2.imread(path)
-            return path, img
-        except Exception:
-            return path, None
-            
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    def load_batch_images(paths):
+        def _read_one(p):
+            try:
+                img = cv2.imread(p)
+                return p, img
+            except Exception:
+                return p, None
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            return list(pool.map(_read_one, paths))
+
+    prefetch_executor = ThreadPoolExecutor(max_workers=2)
+    first_batch = image_paths_to_run[0:batch_size]
+    next_batch_future = prefetch_executor.submit(load_batch_images, first_batch)
+
     for idx, i in enumerate(range(0, total_yolo_images, batch_size)):
-        batch = image_paths_to_run[i:i+batch_size]
-        print(f"[YOLO] Loading batch {idx+1}/{total_yolo_batches} in parallel (images {i} to {min(i+batch_size, total_yolo_images)})...", flush=True)
+        load_results = next_batch_future.result()
         
-        # Parallel image loading
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            load_results = list(executor.map(load_single_image, batch))
-            
+        next_i = i + batch_size
+        if next_i < total_yolo_images:
+            next_batch_paths = image_paths_to_run[next_i:next_i+batch_size]
+            next_batch_future = prefetch_executor.submit(load_batch_images, next_batch_paths)
+
         batch_paths = []
         batch_imgs = []
         for path, img in load_results:
@@ -152,12 +162,14 @@ def generate_predictions_and_triangulate(camera_paths, pkl_output, config_file, 
                 batch_imgs.append(img)
             else:
                 detected_bboxes[path] = default_bbox
-                
+
         if not batch_imgs:
             continue
-            
-        print(f"[YOLO] Running GPU detection on batch {idx+1}/{total_yolo_batches}...", flush=True)
-        results = yolo_model(batch_imgs, verbose=False, conf=0.20, device=device)
+
+        t_start = time.time()
+        results = yolo_model(batch_imgs, verbose=False, conf=0.20, device=device, classes=[0], imgsz=640)
+        t_elapsed = time.time() - t_start
+        print(f"[YOLO] batch {idx+1}/{total_yolo_batches} ({len(batch_imgs)} images) GPU computed in {t_elapsed:.3f} s ({(t_elapsed / max(1, len(batch_imgs))) * 1000:.1f} ms/img)", flush=True)
         for path, res in zip(batch_paths, results):
             bbox = default_bbox
             if len(res.boxes) > 0:

@@ -1773,7 +1773,7 @@ class TrampolineAnnotator(QMainWindow):
             line = line.strip()
             if not line:
                 continue
-            yolo_match = re.search(r"\[YOLO\].*?batch\s*(\d+)/(\d+)", line)
+            yolo_match = re.search(r"\[YOLO\].*?batch\s*(\d+)/(\d+)", line, re.IGNORECASE)
             if yolo_match:
                 curr = int(yolo_match.group(1))
                 total = int(yolo_match.group(2))

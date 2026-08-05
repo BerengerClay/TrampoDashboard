@@ -514,12 +514,12 @@ def parse_args():
     parser.add_argument(
         '--config-file',
         type=str,
-        default='/home/lea/trampo/MODELS_2D3D/Pose2Sim/Config.toml',
+        default='configs/Config.toml',
         help='Path to the Pose2Sim configuration file.')
     parser.add_argument(
         '--calib-file',
         type=str,
-        default='/home/lea/trampo/MODELS_2D3D/Pose2Sim/Calibration/Calib_all.toml',
+        default='configs/Calib.toml',
         help='Path to the camera calibration file.')
     args = parser.parse_args()
     return args
